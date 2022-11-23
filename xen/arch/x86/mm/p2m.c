@@ -737,12 +737,13 @@ int p2m_alloc_table(struct p2m_domain *p2m)
  * hvm fixme: when adding support for pvh non-hardware domains, this path must
  * cleanup any foreign p2m types (release refcnts on them).
  */
-void p2m_teardown(struct p2m_domain *p2m)
+void p2m_teardown(struct p2m_domain *p2m, bool remove_root, bool *preempted)
 /* Return all the p2m pages to Xen.
  * We know we don't have any extra mappings to these pages */
 {
-    struct page_info *pg;
+    struct page_info *pg, *root_pg = NULL;
     struct domain *d;
+    unsigned int i = 0;
 
     if (p2m == NULL)
         return;
@@ -751,10 +752,33 @@ void p2m_teardown(struct p2m_domain *p2m)
 
     p2m_lock(p2m);
     ASSERT(atomic_read(&d->shr_pages) == 0);
-    p2m->phys_table = pagetable_null();
+
+    if ( remove_root )
+        p2m->phys_table = pagetable_null();
+    else if ( !pagetable_is_null(p2m->phys_table) )
+    {
+        root_pg = pagetable_get_page(p2m->phys_table);
+        clear_domain_page(pagetable_get_mfn(p2m->phys_table));
+    }
 
     while ( (pg = page_list_remove_head(&p2m->pages)) )
+    {
+        if ( pg == root_pg )
+            continue;
+
         d->arch.paging.free_page(d, pg);
+
+        /* Arbitrarily check preemption every 1024 iterations */
+        if ( preempted && !(++i % 1024) && general_preempt_check() )
+        {
+            *preempted = true;
+            break;
+        }
+    }
+
+    if ( root_pg )
+        page_list_add(root_pg, &p2m->pages);
+
     p2m_unlock(p2m);
 }
 
@@ -773,16 +797,15 @@ void p2m_final_teardown(struct domain *d)
     p2m_teardown_hostp2m(d);
 }
 
-
-static int
+static int __must_check
 p2m_remove_page(struct p2m_domain *p2m, unsigned long gfn_l, unsigned long mfn,
                 unsigned int page_order)
 {
     unsigned long i;
     gfn_t gfn = _gfn(gfn_l);
-    mfn_t mfn_return;
     p2m_type_t t;
     p2m_access_t a;
+    int rc;
 
     /* IOMMU for PV guests is handled in get_page_type() and put_page(). */
     if ( !paging_mode_translate(p2m->domain) )
@@ -791,19 +814,50 @@ p2m_remove_page(struct p2m_domain *p2m, unsigned long gfn_l, unsigned long mfn,
     ASSERT(gfn_locked_by_me(p2m, gfn));
     P2M_DEBUG("removing gfn=%#lx mfn=%#lx\n", gfn_l, mfn);
 
+    for ( i = 0; i < (1UL << page_order); )
+    {
+        unsigned int cur_order;
+        mfn_t mfn_return = p2m->get_entry(p2m, gfn_add(gfn, i), &t, &a, 0,
+                                          &cur_order, NULL);
+
+        if ( p2m_is_valid(t) &&
+             (!mfn_valid(_mfn(mfn)) || t == p2m_mmio_direct ||
+              mfn + i != mfn_x(mfn_return)) )
+            return -EILSEQ;
+
+        i += (1UL << cur_order) - ((gfn_l + i) & ((1UL << cur_order) - 1));
+    }
+
     if ( mfn_valid(_mfn(mfn)) )
     {
         for ( i = 0; i < (1UL << page_order); i++ )
         {
-            mfn_return = p2m->get_entry(p2m, gfn_add(gfn, i), &t, &a, 0,
-                                        NULL, NULL);
-            if ( !p2m_is_grant(t) && !p2m_is_shared(t) && !p2m_is_foreign(t) )
+            p2m->get_entry(p2m, gfn_add(gfn, i), &t, &a, 0, NULL, NULL);
+            if ( !p2m_is_special(t) && !p2m_is_shared(t) )
                 set_gpfn_from_mfn(mfn+i, INVALID_M2P_ENTRY);
-            ASSERT( !p2m_is_valid(t) || mfn + i == mfn_x(mfn_return) );
         }
     }
-    return p2m_set_entry(p2m, gfn, INVALID_MFN, page_order, p2m_invalid,
-                         p2m->default_access);
+    rc = p2m_set_entry(p2m, gfn, INVALID_MFN, page_order, p2m_invalid,
+                       p2m->default_access);
+    if ( likely(!rc) || !mfn_valid(_mfn(mfn)) )
+        return rc;
+
+    /*
+     * The operation may have partially succeeded. For the failed part we need
+     * to undo the M2P update and, out of precaution, mark the pages dirty
+     * again.
+     */
+    for ( i = 0; i < (1UL << page_order); ++i )
+    {
+        p2m->get_entry(p2m, gfn_add(gfn, i), &t, &a, 0, NULL, NULL);
+        if ( !p2m_is_hole(t) && !p2m_is_special(t) && !p2m_is_shared(t) )
+        {
+            set_gpfn_from_mfn(mfn + i, gfn_l + i);
+            paging_mark_pfn_dirty(p2m->domain, _pfn(gfn_l + i));
+        }
+    }
+
+    return rc;
 }
 
 int
@@ -881,6 +935,12 @@ guest_physmap_add_entry(struct domain *d, gfn_t gfn, mfn_t mfn,
     if ( p2m_is_foreign(t) )
         return -EINVAL;
 
+    if ( !mfn_valid(mfn) || t == p2m_mmio_direct )
+    {
+        ASSERT_UNREACHABLE();
+        return -EINVAL;
+    }
+
     p2m_lock(p2m);
 
     P2M_DEBUG("adding gfn=%#lx mfn=%#lx\n", gfn_x(gfn), mfn_x(mfn));
@@ -919,13 +979,17 @@ guest_physmap_add_entry(struct domain *d, gfn_t gfn, mfn_t mfn,
                                   &ot, &a, 0, NULL, NULL);
             ASSERT(!p2m_is_shared(ot));
         }
-        if ( p2m_is_grant(ot) || p2m_is_foreign(ot) )
+        if ( p2m_is_special(ot) )
         {
-            /* Really shouldn't be unmapping grant/foreign maps this way */
-            domain_crash(d);
+            /* Don't permit unmapping grant/foreign/direct-MMIO this way. */
             p2m_unlock(p2m);
-            
-            return -EINVAL;
+            printk(XENLOG_G_ERR
+                   "%pd: GFN %#lx (%#lx,%u,%u) -> (%#lx,%u,%u) not permitted\n",
+                   d, gfn_x(gfn) + i,
+                   mfn_x(omfn), ot, a,
+                   mfn_x(mfn) + i, t, p2m->default_access);
+            domain_crash(d);
+            return -EPERM;
         }
         else if ( p2m_is_ram(ot) && !p2m_is_paged(ot) )
         {
@@ -973,21 +1037,17 @@ guest_physmap_add_entry(struct domain *d, gfn_t gfn, mfn_t mfn,
                 ASSERT(mfn_valid(omfn));
                 P2M_DEBUG("old gfn=%#lx -> mfn %#lx\n",
                           gfn_x(ogfn) , mfn_x(omfn));
-                if ( mfn_eq(omfn, mfn_add(mfn, i)) )
-                    p2m_remove_page(p2m, gfn_x(ogfn), mfn_x(mfn_add(mfn, i)),
-                                    0);
+                if ( mfn_eq(omfn, mfn_add(mfn, i)) &&
+                     (rc = p2m_remove_page(p2m, gfn_x(ogfn), mfn_x(omfn), 0)) )
+                    goto out;
             }
         }
     }
 
     /* Now, actually do the two-way mapping */
-    if ( mfn_valid(mfn) )
+    rc = p2m_set_entry(p2m, gfn, mfn, page_order, t, p2m->default_access);
+    if ( likely(!rc) )
     {
-        rc = p2m_set_entry(p2m, gfn, mfn, page_order, t,
-                           p2m->default_access);
-        if ( rc )
-            goto out; /* Failed to update p2m, bail without updating m2p. */
-
         if ( !p2m_is_grant(t) )
         {
             for ( i = 0; i < (1UL << page_order); i++ )
@@ -997,20 +1057,42 @@ guest_physmap_add_entry(struct domain *d, gfn_t gfn, mfn_t mfn,
     }
     else
     {
-        gdprintk(XENLOG_WARNING, "Adding bad mfn to p2m map (%#lx -> %#lx)\n",
-                 gfn_x(gfn), mfn_x(mfn));
-        rc = p2m_set_entry(p2m, gfn, INVALID_MFN, page_order,
-                           p2m_invalid, p2m->default_access);
-        if ( rc == 0 )
+        /*
+         * The operation may have partially succeeded. For the successful part
+         * we need to update M2P and dirty state, while for the failed part we
+         * may need to adjust PoD stats as well as undo the earlier M2P update.
+         */
+        for ( i = 0; i < (1UL << page_order); ++i )
         {
-            pod_lock(p2m);
-            p2m->pod.entry_count -= pod_count;
-            BUG_ON(p2m->pod.entry_count < 0);
-            pod_unlock(p2m);
+            omfn = p2m->get_entry(p2m, gfn_add(gfn, i), &ot, &a, 0, NULL, NULL);
+            if ( p2m_is_pod(ot) )
+            {
+                BUG_ON(!pod_count);
+                --pod_count;
+            }
+            else if ( mfn_eq(omfn, mfn_add(mfn, i)) && ot == t &&
+                      a == p2m->default_access && !p2m_is_grant(t) )
+            {
+                set_gpfn_from_mfn(mfn_x(omfn), gfn_x(gfn) + i);
+                paging_mark_pfn_dirty(d, _pfn(gfn_x(gfn) + i));
+            }
+            else if ( p2m_is_ram(ot) && !p2m_is_paged(ot) )
+            {
+                ASSERT(mfn_valid(omfn));
+                set_gpfn_from_mfn(mfn_x(omfn), gfn_x(gfn) + i);
+            }
         }
     }
 
-out:
+    if ( pod_count )
+    {
+        pod_lock(p2m);
+        p2m->pod.entry_count -= pod_count;
+        BUG_ON(p2m->pod.entry_count < 0);
+        pod_unlock(p2m);
+    }
+
+ out:
     p2m_unlock(p2m);
 
     return rc;
@@ -1032,8 +1114,7 @@ int p2m_change_type_one(struct domain *d, unsigned long gfn_l,
     struct p2m_domain *p2m = p2m_get_hostp2m(d);
     int rc;
 
-    BUG_ON(p2m_is_grant(ot) || p2m_is_grant(nt));
-    BUG_ON(p2m_is_foreign(ot) || p2m_is_foreign(nt));
+    BUG_ON(p2m_is_special(ot) || p2m_is_special(nt));
 
     gfn_lock(p2m, gfn, 0);
 
@@ -1194,7 +1275,7 @@ static int finish_type_change(struct p2m_domain *p2m,
         rc = p2m->recalc(p2m, gfn);
         /*
          * ept->recalc could return 0/1/-ENOMEM. pt->recalc could return
-         * 0/-ENOMEM/-ENOENT, -ENOENT isn't an error as we are looping
+         * 0/1/-ENOMEM/-ENOENT, -ENOENT isn't an error as we are looping
          * gfn here. If rc is 1 we need to have it 0 for success.
          */
         if ( rc == -ENOENT || rc > 0 )
@@ -1280,11 +1361,69 @@ static int set_typed_p2m_entry(struct domain *d, unsigned long gfn_l,
         gfn_unlock(p2m, gfn, order);
         return cur_order + 1;
     }
-    if ( p2m_is_grant(ot) || p2m_is_foreign(ot) )
+    if ( p2m_is_special(ot) )
     {
-        gfn_unlock(p2m, gfn, order);
-        domain_crash(d);
-        return -ENOENT;
+        /* Special-case (almost) identical mappings. */
+        if ( !mfn_eq(mfn, omfn) || gfn_p2mt != ot )
+        {
+            gfn_unlock(p2m, gfn, order);
+            printk(XENLOG_G_ERR
+                   "%pd: GFN %#lx (%#lx,%u,%u,%u) -> (%#lx,%u,%u,%u) not permitted\n",
+                   d, gfn_l,
+                   mfn_x(omfn), cur_order, ot, a,
+                   mfn_x(mfn), order, gfn_p2mt, access);
+            domain_crash(d);
+            return -EPERM;
+        }
+
+        if ( access == a )
+        {
+            gfn_unlock(p2m, gfn, order);
+            return 0;
+        }
+    }
+
+    P2M_DEBUG("set %d %lx %lx\n", gfn_p2mt, gfn_l, mfn_x(mfn));
+    rc = p2m_set_entry(p2m, gfn, mfn, order, gfn_p2mt, access);
+    if ( unlikely(rc) )
+    {
+        gdprintk(XENLOG_ERR, "p2m_set_entry: %#lx:%u -> %d (0x%"PRI_mfn")\n",
+                 gfn_l, order, rc, mfn_x(mfn));
+
+        /*
+         * The operation may have partially succeeded. For the successful part
+         * we need to update PoD stats, M2P, and dirty state.
+         */
+        if ( order != PAGE_ORDER_4K )
+        {
+            unsigned long i;
+
+            for ( i = 0; i < (1UL << order); ++i )
+            {
+                p2m_type_t t;
+                mfn_t cmfn = p2m->get_entry(p2m, gfn_add(gfn, i), &t, &a, 0,
+                                            NULL, NULL);
+
+                if ( !mfn_eq(cmfn, mfn_add(mfn, i)) || t != gfn_p2mt ||
+                     a != access )
+                    continue;
+
+                if ( p2m_is_ram(ot) )
+                {
+                    ASSERT(mfn_valid(mfn_add(omfn, i)));
+                    set_gpfn_from_mfn(mfn_x(omfn) + i, INVALID_M2P_ENTRY);
+                }
+#ifdef CONFIG_HVM
+                else if ( p2m_is_pod(ot) )
+                {
+                    pod_lock(p2m);
+                    BUG_ON(!p2m->pod.entry_count);
+                    --p2m->pod.entry_count;
+                    pod_unlock(p2m);
+                }
+#endif
+            }
+        }
     }
     else if ( p2m_is_ram(ot) )
     {
@@ -1296,12 +1435,6 @@ static int set_typed_p2m_entry(struct domain *d, unsigned long gfn_l,
             set_gpfn_from_mfn(mfn_x(omfn) + i, INVALID_M2P_ENTRY);
         }
     }
-
-    P2M_DEBUG("set %d %lx %lx\n", gfn_p2mt, gfn_l, mfn_x(mfn));
-    rc = p2m_set_entry(p2m, gfn, mfn, order, gfn_p2mt, access);
-    if ( rc )
-        gdprintk(XENLOG_ERR, "p2m_set_entry: %#lx:%u -> %d (0x%"PRI_mfn")\n",
-                 gfn_l, order, rc, mfn_x(mfn));
 #ifdef CONFIG_HVM
     else if ( p2m_is_pod(ot) )
     {
@@ -1344,12 +1477,12 @@ int set_identity_p2m_entry(struct domain *d, unsigned long gfn_l,
     struct p2m_domain *p2m = p2m_get_hostp2m(d);
     int ret;
 
-    if ( !paging_mode_translate(p2m->domain) )
+    if ( !paging_mode_translate(d) )
     {
         if ( !is_iommu_enabled(d) )
             return 0;
         return iommu_legacy_map(d, _dfn(gfn_l), _mfn(gfn_l), PAGE_ORDER_4K,
-                                IOMMUF_readable | IOMMUF_writable);
+                                p2m_access_to_iommu_flags(p2ma));
     }
 
     gfn_lock(p2m, gfn, 0);
@@ -1384,8 +1517,8 @@ int set_identity_p2m_entry(struct domain *d, unsigned long gfn_l,
  *    order+1  for caller to retry with order (guaranteed smaller than
  *             the order value passed in)
  */
-int clear_mmio_p2m_entry(struct domain *d, unsigned long gfn_l, mfn_t mfn,
-                         unsigned int order)
+static int clear_mmio_p2m_entry(struct domain *d, unsigned long gfn_l,
+                                mfn_t mfn, unsigned int order)
 {
     int rc = -EINVAL;
     gfn_t gfn = _gfn(gfn_l);
@@ -2698,9 +2831,9 @@ int p2m_change_altp2m_gfn(struct domain *d, unsigned int idx,
     if ( gfn_eq(new_gfn, INVALID_GFN) )
     {
         mfn = ap2m->get_entry(ap2m, old_gfn, &t, &a, 0, NULL, NULL);
-        if ( mfn_valid(mfn) )
-            p2m_remove_page(ap2m, gfn_x(old_gfn), mfn_x(mfn), PAGE_ORDER_4K);
-        rc = 0;
+        rc = mfn_valid(mfn)
+             ? p2m_remove_page(ap2m, gfn_x(old_gfn), mfn_x(mfn), PAGE_ORDER_4K)
+             : 0;
         goto out;
     }
 

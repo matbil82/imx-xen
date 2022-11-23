@@ -43,14 +43,22 @@ void disable_qinval(struct vtd_iommu *iommu);
 int enable_intremap(struct vtd_iommu *iommu, int eim);
 void disable_intremap(struct vtd_iommu *iommu);
 
-void iommu_flush_cache_entry(void *addr, unsigned int size);
-void iommu_flush_cache_page(void *addr, unsigned long npages);
 int iommu_alloc(struct acpi_drhd_unit *drhd);
 void iommu_free(struct acpi_drhd_unit *drhd);
 
 int iommu_flush_iec_global(struct vtd_iommu *iommu);
 int iommu_flush_iec_index(struct vtd_iommu *iommu, u8 im, u16 iidx);
 void clear_fault_bits(struct vtd_iommu *iommu);
+
+int __must_check vtd_flush_context_reg(struct vtd_iommu *iommu, uint16_t did,
+                                       uint16_t source_id,
+                                       uint8_t function_mask, uint64_t type,
+                                       bool flush_non_present_entry);
+int __must_check vtd_flush_iotlb_reg(struct vtd_iommu *iommu, uint16_t did,
+                                     uint64_t addr, unsigned int size_order,
+                                     uint64_t type,
+                                     bool flush_non_present_entry,
+                                     bool flush_dev_iotlb);
 
 struct vtd_iommu *ioapic_to_iommu(unsigned int apic_id);
 struct vtd_iommu *hpet_to_iommu(unsigned int hpet_id);
@@ -69,8 +77,6 @@ int __must_check qinval_device_iotlb_sync(struct vtd_iommu *iommu,
                                           struct pci_dev *pdev,
                                           u16 did, u16 size, u64 addr);
 
-unsigned int get_cache_line_size(void);
-void cacheline_flush(char *);
 void flush_all_cache(void);
 
 uint64_t alloc_pgtable_maddr(unsigned long npages, nodeid_t node);
@@ -78,9 +84,11 @@ void free_pgtable_maddr(u64 maddr);
 void *map_vtd_domain_page(u64 maddr);
 void unmap_vtd_domain_page(void *va);
 int domain_context_mapping_one(struct domain *domain, struct vtd_iommu *iommu,
-                               u8 bus, u8 devfn, const struct pci_dev *);
+                               uint8_t bus, uint8_t devfn,
+                               const struct pci_dev *pdev, domid_t domid,
+                               paddr_t pgd_maddr, unsigned int mode);
 int domain_context_unmap_one(struct domain *domain, struct vtd_iommu *iommu,
-                             u8 bus, u8 devfn);
+                             uint8_t bus, uint8_t devfn);
 int intel_iommu_get_reserved_device_memory(iommu_grdm_t *func, void *ctxt);
 
 unsigned int io_apic_read_remap_rte(unsigned int apic, unsigned int reg);
@@ -98,8 +106,9 @@ int is_igd_vt_enabled_quirk(void);
 void platform_quirks_init(void);
 void vtd_ops_preamble_quirk(struct vtd_iommu *iommu);
 void vtd_ops_postamble_quirk(struct vtd_iommu *iommu);
-int __must_check me_wifi_quirk(struct domain *domain,
-                               u8 bus, u8 devfn, int map);
+int __must_check me_wifi_quirk(struct domain *domain, uint8_t bus,
+                               uint8_t devfn, domid_t domid, paddr_t pgd_maddr,
+                               unsigned int mode);
 void pci_vtd_quirk(const struct pci_dev *);
 void quirk_iommu_caps(struct vtd_iommu *iommu);
 

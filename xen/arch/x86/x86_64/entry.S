@@ -90,7 +90,6 @@ process_softirqs:
         sti
 .Lbounce_exception:
         call  create_bounce_frame
-        movb  $0, TRAPBOUNCE_flags(%rdx)
         jmp   test_all_events
 
         ALIGN
@@ -183,7 +182,7 @@ restore_all_guest:
         jz    iret_exit_to_guest
 
         movq  24(%rsp),%r11           # RFLAGS
-        andq  $~(X86_EFLAGS_IOPL|X86_EFLAGS_NT|X86_EFLAGS_VM),%r11
+        andq  $~(X86_EFLAGS_IOPL | X86_EFLAGS_VM), %r11
         orq   $X86_EFLAGS_IF,%r11
 
         /* Don't use SYSRET path if the return address is not canonical. */
@@ -203,7 +202,7 @@ restore_all_guest:
         ALIGN
 /* No special register assumptions. */
 iret_exit_to_guest:
-        andl  $~(X86_EFLAGS_IOPL|X86_EFLAGS_NT|X86_EFLAGS_VM),24(%rsp)
+        andl  $~(X86_EFLAGS_IOPL | X86_EFLAGS_VM), 24(%rsp)
         orl   $X86_EFLAGS_IF,24(%rsp)
         addq  $8,%rsp
 .Lft0:  iretq
@@ -236,7 +235,7 @@ ENTRY(lstar_enter)
         movl  $TRAP_syscall, 4(%rsp)
         SAVE_ALL
 
-        SPEC_CTRL_ENTRY_FROM_PV /* Req: %rsp=regs/cpuinfo, Clob: acd */
+        SPEC_CTRL_ENTRY_FROM_PV /* Req: %rsp=regs/cpuinfo, %rdx=0, Clob: acd */
         /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
 
         GET_STACK_END(bx)
@@ -271,7 +270,7 @@ GLOBAL(sysenter_eflags_saved)
         movl  $TRAP_syscall, 4(%rsp)
         SAVE_ALL
 
-        SPEC_CTRL_ENTRY_FROM_PV /* Req: %rsp=regs/cpuinfo, Clob: acd */
+        SPEC_CTRL_ENTRY_FROM_PV /* Req: %rsp=regs/cpuinfo, %rdx=0, Clob: acd */
         /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
 
         GET_STACK_END(bx)
@@ -297,7 +296,6 @@ UNLIKELY_START(nz, sysenter_nt_set)
         pushfq
         andl  $~X86_EFLAGS_NT,(%rsp)
         popfq
-        xorl  %eax,%eax
 UNLIKELY_END(sysenter_nt_set)
         testq %rax,%rax
         leal  (,%rcx,TBF_INTERRUPT),%ecx
@@ -323,7 +321,7 @@ ENTRY(int80_direct_trap)
         movl  $0x80, 4(%rsp)
         SAVE_ALL
 
-        SPEC_CTRL_ENTRY_FROM_PV /* Req: %rsp=regs/cpuinfo, Clob: acd */
+        SPEC_CTRL_ENTRY_FROM_PV /* Req: %rsp=regs/cpuinfo, %rdx=0, Clob: acd */
         /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
 
         GET_STACK_END(bx)
@@ -495,6 +493,11 @@ UNLIKELY_START(z, create_bounce_frame_bad_bounce_ip)
         jmp   asm_domain_crash_synchronous  /* Does not return */
 __UNLIKELY_END(create_bounce_frame_bad_bounce_ip)
         movq  %rax,UREGS_rip+8(%rsp)
+
+        /* Trapbounce complete.  Clobber state to avoid an erroneous second injection. */
+        xor   %eax, %eax
+        mov   %rax, TRAPBOUNCE_eip(%rdx)
+        mov   %al,  TRAPBOUNCE_flags(%rdx)
         ret
 
         .pushsection .fixup, "ax", @progbits
@@ -578,7 +581,7 @@ ENTRY(common_interrupt)
 
         GET_STACK_END(14)
 
-        SPEC_CTRL_ENTRY_FROM_INTR /* Req: %rsp=regs, %r14=end, Clob: acd */
+        SPEC_CTRL_ENTRY_FROM_INTR /* Req: %rsp=regs, %r14=end, %rdx=0, Clob: acd */
         /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
 
         mov   STACK_CPUINFO_FIELD(xen_cr3)(%r14), %rcx
@@ -610,7 +613,7 @@ GLOBAL(handle_exception)
 
         GET_STACK_END(14)
 
-        SPEC_CTRL_ENTRY_FROM_INTR /* Req: %rsp=regs, %r14=end, Clob: acd */
+        SPEC_CTRL_ENTRY_FROM_INTR /* Req: %rsp=regs, %r14=end, %rdx=0, Clob: acd */
         /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
 
         mov   STACK_CPUINFO_FIELD(xen_cr3)(%r14), %rcx
@@ -802,7 +805,7 @@ ENTRY(double_fault)
 
         GET_STACK_END(14)
 
-        SPEC_CTRL_ENTRY_FROM_INTR_IST /* Req: %rsp=regs, %r14=end, Clob: acd */
+        SPEC_CTRL_ENTRY_FROM_INTR_IST /* Req: %rsp=regs, %r14=end, %rdx=0, Clob: abcd */
         /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
 
         mov   STACK_CPUINFO_FIELD(xen_cr3)(%r14), %rbx
@@ -835,7 +838,7 @@ handle_ist_exception:
 
         GET_STACK_END(14)
 
-        SPEC_CTRL_ENTRY_FROM_INTR_IST /* Req: %rsp=regs, %r14=end, Clob: acd */
+        SPEC_CTRL_ENTRY_FROM_INTR_IST /* Req: %rsp=regs, %r14=end, %rdx=0, Clob: abcd */
         /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
 
         mov   STACK_CPUINFO_FIELD(xen_cr3)(%r14), %rcx
@@ -914,7 +917,7 @@ GLOBAL(trap_nop)
 GLOBAL(autogen_entrypoints)
         /* pop into the .init.rodata section and record an entry point. */
         .macro entrypoint ent
-        .pushsection .init.rodata
+        .pushsection .init.rodata, "a", @progbits
         .quad \ent
         .popsection
         .endm
@@ -958,5 +961,5 @@ autogen_stubs: /* Automatically generated stubs. */
         vec = vec + 1
         .endr
 
-        .section .init.rodata
+        .section .init.rodata, "a", @progbits
         .size autogen_entrypoints, . - autogen_entrypoints

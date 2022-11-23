@@ -987,8 +987,9 @@ static void svm_ctxt_switch_to(struct vcpu *v)
         wrmsr_tsc_aux(v->arch.msrs->tsc_aux);
 }
 
-static void noreturn svm_do_resume(struct vcpu *v)
+static void noreturn svm_do_resume(void)
 {
+    struct vcpu *v = current;
     struct vmcb_struct *vmcb = v->arch.hvm.svm.vmcb;
     bool debug_state = (v->domain->debugger_attached ||
                         v->domain->arch.monitor.software_breakpoint_enabled ||
@@ -1032,7 +1033,7 @@ static void noreturn svm_do_resume(struct vcpu *v)
 
     hvm_do_resume(v);
 
-    reset_stack_and_jump_nolp(svm_asm_do_resume);
+    reset_stack_and_jump(svm_asm_do_resume);
 }
 
 void svm_vmenter_helper(const struct cpu_user_regs *regs)
@@ -1082,7 +1083,7 @@ static void svm_guest_osvw_init(struct domain *d)
     spin_unlock(&osvw_lock);
 }
 
-void svm_host_osvw_reset()
+static void svm_host_osvw_reset(void)
 {
     spin_lock(&osvw_lock);
 
@@ -1092,7 +1093,7 @@ void svm_host_osvw_reset()
     spin_unlock(&osvw_lock);
 }
 
-void svm_host_osvw_init()
+static void svm_host_osvw_init(void)
 {
     spin_lock(&osvw_lock);
 
@@ -1522,8 +1523,7 @@ static void svm_init_erratum_383(const struct cpuinfo_x86 *c)
 
 #ifdef CONFIG_PV
 bool svm_load_segs(unsigned int ldt_ents, unsigned long ldt_base,
-                   unsigned int fs_sel, unsigned long fs_base,
-                   unsigned int gs_sel, unsigned long gs_base,
+                   unsigned long fs_base, unsigned long gs_base,
                    unsigned long gs_shadow)
 {
     unsigned int cpu = smp_processor_id();
@@ -1560,14 +1560,12 @@ bool svm_load_segs(unsigned int ldt_ents, unsigned long ldt_base,
         vmcb->ldtr.base = ldt_base;
     }
 
-    ASSERT(!(fs_sel & ~3));
-    vmcb->fs.sel = fs_sel;
+    vmcb->fs.sel = 0;
     vmcb->fs.attr = 0;
     vmcb->fs.limit = 0;
     vmcb->fs.base = fs_base;
 
-    ASSERT(!(gs_sel & ~3));
-    vmcb->gs.sel = gs_sel;
+    vmcb->gs.sel = 0;
     vmcb->gs.attr = 0;
     vmcb->gs.limit = 0;
     vmcb->gs.base = gs_base;
@@ -1659,6 +1657,7 @@ const struct hvm_function_table * __init start_svm(void)
     P(cpu_has_pause_filter, "Pause-Intercept Filter");
     P(cpu_has_pause_thresh, "Pause-Intercept Filter Threshold");
     P(cpu_has_tsc_ratio, "TSC Rate MSR");
+    P(cpu_has_svm_spec_ctrl, "MSR_SPEC_CTRL virtualisation");
 #undef P
 
     if ( !printed )
@@ -2947,9 +2946,10 @@ void svm_vmexit_handler(struct cpu_user_regs *regs)
             v->arch.hvm.svm.cached_insn_len = vmcb->guest_ins_len & 0xf;
         rc = vmcb->exitinfo1 & PFEC_page_present
              ? p2m_pt_handle_deferred_changes(vmcb->exitinfo2) : 0;
-        if ( rc >= 0 )
+        if ( rc == 0 )
+            /* If no recal adjustments were being made - handle this fault */
             svm_do_nested_pgfault(v, regs, vmcb->exitinfo1, vmcb->exitinfo2);
-        else
+        else if ( rc < 0 )
         {
             printk(XENLOG_G_ERR
                    "%pv: Error %d handling NPF (gpa=%08lx ec=%04lx)\n",

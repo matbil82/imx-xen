@@ -358,14 +358,14 @@ void start_secondary(void *unused)
 
     initialize_cpu_data(cpu);
 
-    microcode_update_one(false);
+    microcode_update_one();
 
     /*
      * If any speculative control MSRs are available, apply Xen's default
      * settings.  Note: These MSRs may only become available after loading
      * microcode.
      */
-    if ( boot_cpu_has(X86_FEATURE_IBRSB) )
+    if ( boot_cpu_has(X86_FEATURE_IBRSB) || boot_cpu_has(X86_FEATURE_IBRS) )
         wrmsrl(MSR_SPEC_CTRL, default_xen_spec_ctrl);
     if ( boot_cpu_has(X86_FEATURE_SRBDS_CTRL) )
         wrmsrl(MSR_MCU_OPT_CTRL, default_xen_mcu_opt_ctrl);

@@ -264,6 +264,18 @@ int libxl_cpuid_parse_config(libxl_cpuid_policy_list *cpuid, const char* str)
         {"rstr-fp-err-ptrs", 0x80000008, NA, CPUID_REG_EBX, 2, 1},
         {"wbnoinvd",     0x80000008, NA, CPUID_REG_EBX,  9,  1},
         {"ibpb",         0x80000008, NA, CPUID_REG_EBX, 12,  1},
+        {"ibrs",         0x80000008, NA, CPUID_REG_EBX, 14,  1},
+        {"amd-stibp",    0x80000008, NA, CPUID_REG_EBX, 15,  1},
+        {"ibrs-always",  0x80000008, NA, CPUID_REG_EBX, 16,  1},
+        {"stibp-always", 0x80000008, NA, CPUID_REG_EBX, 17,  1},
+        {"ibrs-fast",    0x80000008, NA, CPUID_REG_EBX, 18,  1},
+        {"ibrs-same-mode", 0x80000008, NA, CPUID_REG_EBX, 19,  1},
+        {"amd-ssbd",     0x80000008, NA, CPUID_REG_EBX, 24,  1},
+        {"virt-ssbd",    0x80000008, NA, CPUID_REG_EBX, 25,  1},
+        {"ssb-no",       0x80000008, NA, CPUID_REG_EBX, 26,  1},
+        {"psfd",         0x80000008, NA, CPUID_REG_EBX, 28,  1},
+        {"btc-no",       0x80000008, NA, CPUID_REG_EBX, 29,  1},
+        {"ibpb-ret",     0x80000008, NA, CPUID_REG_EBX, 30,  1},
 
         {"nc",           0x80000008, NA, CPUID_REG_ECX,  0,  8},
         {"apicidsize",   0x80000008, NA, CPUID_REG_ECX, 12,  4},
@@ -420,12 +432,17 @@ void libxl_cpuid_apply_policy(libxl_ctx *ctx, uint32_t domid)
 void libxl_cpuid_set(libxl_ctx *ctx, uint32_t domid,
                      libxl_cpuid_policy_list cpuid)
 {
-    int i;
+    int i, j;
     char *cpuid_res[4];
 
     for (i = 0; cpuid[i].input[0] != XEN_CPUID_INPUT_UNUSED; i++)
+    {
         xc_cpuid_set(ctx->xch, domid, cpuid[i].input,
                      (const char**)(cpuid[i].policy), cpuid_res);
+
+        for (j = 0; j < ARRAY_SIZE(cpuid_res); ++j)
+            free(cpuid_res[j]);
+    }
 }
 
 static const char *input_names[2] = { "leaf", "subleaf" };

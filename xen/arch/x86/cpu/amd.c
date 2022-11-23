@@ -3,6 +3,7 @@
 #include <xen/mm.h>
 #include <xen/smp.h>
 #include <xen/pci.h>
+#include <xen/warning.h>
 #include <asm/io.h>
 #include <asm/msr.h>
 #include <asm/processor.h>
@@ -539,6 +540,81 @@ void early_init_amd(struct cpuinfo_x86 *c)
 	ctxt_switch_levelling(NULL);
 }
 
+/*
+ * Refer to the AMD Speculative Store Bypass whitepaper:
+ * https://developer.amd.com/wp-content/resources/124441_AMD64_SpeculativeStoreBypassDisable_Whitepaper_final.pdf
+ */
+void amd_init_ssbd(const struct cpuinfo_x86 *c)
+{
+	int bit = -1;
+
+	if (cpu_has_ssb_no)
+		return;
+
+	if (cpu_has_amd_ssbd) {
+		/* Handled by common MSR_SPEC_CTRL logic */
+		return;
+	}
+
+	if (cpu_has_virt_ssbd) {
+		wrmsrl(MSR_VIRT_SPEC_CTRL, opt_ssbd ? SPEC_CTRL_SSBD : 0);
+		return;
+	}
+
+	switch (c->x86) {
+	case 0x15: bit = 54; break;
+	case 0x16: bit = 33; break;
+	case 0x17:
+	case 0x18: bit = 10; break;
+	}
+
+	if (bit >= 0) {
+		uint64_t val, mask = 1ull << bit;
+
+		if (rdmsr_safe(MSR_AMD64_LS_CFG, val) ||
+		    ({
+			    val &= ~mask;
+			    if (opt_ssbd)
+				    val |= mask;
+			    false;
+		    }) ||
+		    wrmsr_safe(MSR_AMD64_LS_CFG, val) ||
+		    ({
+			    rdmsrl(MSR_AMD64_LS_CFG, val);
+			    (val & mask) != (opt_ssbd * mask);
+		    }))
+			bit = -1;
+	}
+
+	if (bit < 0)
+		printk_once(XENLOG_ERR "No SSBD controls available\n");
+}
+
+/*
+ * On Zen2 we offer this chicken (bit) on the altar of Speculation.
+ *
+ * Refer to the AMD Branch Type Confusion whitepaper:
+ * https://XXX
+ *
+ * Setting this unnamed bit supposedly causes prediction information on
+ * non-branch instructions to be ignored.  It is to be set unilaterally in
+ * newer microcode.
+ *
+ * This chickenbit is something unrelated on Zen1, and Zen1 vs Zen2 isn't a
+ * simple model number comparison, so use STIBP as a heuristic to separate the
+ * two uarches in Fam17h(AMD)/18h(Hygon).
+ */
+void amd_init_spectral_chicken(void)
+{
+	uint64_t val, chickenbit = 1 << 1;
+
+	if (cpu_has_hypervisor || !boot_cpu_has(X86_FEATURE_AMD_STIBP))
+		return;
+
+	if (rdmsr_safe(MSR_AMD64_DE_CFG2, val) == 0 && !(val & chickenbit))
+		wrmsr_safe(MSR_AMD64_DE_CFG2, val | chickenbit);
+}
+
 static void init_amd(struct cpuinfo_x86 *c)
 {
 	u32 l, h;
@@ -615,28 +691,22 @@ static void init_amd(struct cpuinfo_x86 *c)
 				  c->x86_capability);
 	}
 
-	/*
-	 * If the user has explicitly chosen to disable Memory Disambiguation
-	 * to mitigiate Speculative Store Bypass, poke the appropriate MSR.
-	 */
-	if (opt_ssbd) {
-		int bit = -1;
+	amd_init_ssbd(c);
 
-		switch (c->x86) {
-		case 0x15: bit = 54; break;
-		case 0x16: bit = 33; break;
-		case 0x17: bit = 10; break;
-		}
-
-		if (bit >= 0 && !rdmsr_safe(MSR_AMD64_LS_CFG, value)) {
-			value |= 1ull << bit;
-			wrmsr_safe(MSR_AMD64_LS_CFG, value);
-		}
-	}
+	if (c->x86 == 0x17)
+		amd_init_spectral_chicken();
 
 	/* MFENCE stops RDTSC speculation */
 	if (!cpu_has_lfence_dispatch)
 		__set_bit(X86_FEATURE_MFENCE_RDTSC, c->x86_capability);
+
+	/*
+	 * On pre-CLFLUSHOPT AMD CPUs, CLFLUSH is weakly ordered with
+	 * everything, including reads and writes to address, and
+	 * LFENCE/SFENCE instructions.
+	 */
+	if (c == &boot_cpu_data && !cpu_has_clflushopt)
+		setup_force_cpu_cap(X86_BUG_CLFLUSH_MFENCE);
 
 	switch(c->x86)
 	{
@@ -644,6 +714,36 @@ static void init_amd(struct cpuinfo_x86 *c)
 		disable_c1e(NULL);
 		if (acpi_smi_cmd && (acpi_enable_value | acpi_disable_value))
 			amd_acpi_c1e_quirk = true;
+		break;
+
+	case 0x15: case 0x16:
+		/*
+		 * There are some Fam15/Fam16 systems where upon resume from S3
+		 * firmware fails to re-setup properly functioning RDRAND.
+		 * By the time we can spot the problem, it is too late to take
+		 * action, and there is nothing Xen can do to repair the problem.
+		 * Clear the feature unless force-enabled on the command line.
+		 */
+		if (c == &boot_cpu_data &&
+		    cpu_has(c, X86_FEATURE_RDRAND) &&
+		    !is_forced_cpu_cap(X86_FEATURE_RDRAND)) {
+			static const char __initconst text[] =
+				"RDRAND may cease to work on this hardware upon resume from S3.\n"
+				"Please choose an explicit cpuid={no-}rdrand setting.\n";
+
+			setup_clear_cpu_cap(X86_FEATURE_RDRAND);
+			warning_add(text);
+		}
+		break;
+
+	case 0x19:
+		/*
+		 * Zen3 (Fam19h model < 0x10) parts are not susceptible to
+		 * Branch Type Confusion, but predate the allocation of the
+		 * BTC_NO bit.  Fill it back in if we're not virtualised.
+		 */
+		if (!cpu_has_hypervisor && !cpu_has(c, X86_FEATURE_BTC_NO))
+			__set_bit(X86_FEATURE_BTC_NO, c->x86_capability);
 		break;
 	}
 

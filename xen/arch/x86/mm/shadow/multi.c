@@ -520,7 +520,8 @@ _sh_propagate(struct vcpu *v,
     {
         /* Guest l1e maps emulated MMIO space */
         *sp = sh_l1e_mmio(target_gfn, gflags);
-        d->arch.paging.shadow.has_fast_mmio_entries = true;
+        if ( sh_l1e_is_magic(*sp) )
+            d->arch.paging.shadow.has_fast_mmio_entries = true;
         goto done;
     }
 
@@ -1523,7 +1524,8 @@ sh_make_monitor_table(struct vcpu *v)
     ASSERT(pagetable_get_pfn(v->arch.monitor_table) == 0);
 
     /* Guarantee we can get the memory we need */
-    shadow_prealloc(d, SH_type_monitor_table, CONFIG_PAGING_LEVELS);
+    if ( !shadow_prealloc(d, SH_type_monitor_table, CONFIG_PAGING_LEVELS) )
+        return INVALID_MFN;
 
     {
         mfn_t m4mfn;
@@ -3051,9 +3053,14 @@ static int sh_page_fault(struct vcpu *v,
      * Preallocate shadow pages *before* removing writable accesses
      * otherwhise an OOS L1 might be demoted and promoted again with
      * writable mappings. */
-    shadow_prealloc(d,
-                    SH_type_l1_shadow,
-                    GUEST_PAGING_LEVELS < 4 ? 1 : GUEST_PAGING_LEVELS - 1);
+    if ( !shadow_prealloc(d, SH_type_l1_shadow,
+                          GUEST_PAGING_LEVELS < 4
+                          ? 1 : GUEST_PAGING_LEVELS - 1) )
+    {
+        paging_unlock(d);
+        put_gfn(d, gfn_x(gfn));
+        return 0;
+    }
 
     rc = gw_remove_write_accesses(v, va, &gw);
 
@@ -3860,6 +3867,7 @@ sh_set_toplevel_shadow(struct vcpu *v,
     /* Now figure out the new contents: is this a valid guest MFN? */
     if ( !mfn_valid(gmfn) )
     {
+        ASSERT(mfn_eq(gmfn, INVALID_MFN));
         new_entry = pagetable_null();
         goto install_new_entry;
     }
@@ -3869,7 +3877,12 @@ sh_set_toplevel_shadow(struct vcpu *v,
     if ( !mfn_valid(smfn) )
     {
         /* Make sure there's enough free shadow memory. */
-        shadow_prealloc(d, root_type, 1);
+        if ( !shadow_prealloc(d, root_type, 1) )
+        {
+            new_entry = pagetable_null();
+            goto install_new_entry;
+        }
+
         /* Shadow the page. */
         smfn = sh_make_shadow(v, gmfn, root_type);
     }
@@ -4013,6 +4026,11 @@ sh_update_cr3(struct vcpu *v, int do_locking, bool noflush)
     if ( sh_remove_write_access(d, gmfn, 2, 0) != 0 )
         flush_tlb_mask(d->dirty_cpumask);
     sh_set_toplevel_shadow(v, 0, gmfn, SH_type_l2_shadow);
+    if ( unlikely(pagetable_is_null(v->arch.shadow_table[0])) )
+    {
+        ASSERT(d->is_dying || d->is_shutting_down);
+        return;
+    }
 #elif GUEST_PAGING_LEVELS == 3
     /* PAE guests have four shadow_table entries, based on the
      * current values of the guest's four l3es. */
@@ -4058,6 +4076,11 @@ sh_update_cr3(struct vcpu *v, int do_locking, bool noflush)
     if ( sh_remove_write_access(d, gmfn, 4, 0) != 0 )
         flush_tlb_mask(d->dirty_cpumask);
     sh_set_toplevel_shadow(v, 0, gmfn, SH_type_l4_shadow);
+    if ( unlikely(pagetable_is_null(v->arch.shadow_table[0])) )
+    {
+        ASSERT(d->is_dying || d->is_shutting_down);
+        return;
+    }
     if ( !shadow_mode_external(d) && !is_pv_32bit_domain(d) )
     {
         mfn_t smfn = pagetable_get_mfn(v->arch.shadow_table[0]);

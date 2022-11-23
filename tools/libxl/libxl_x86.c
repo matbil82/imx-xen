@@ -345,10 +345,20 @@ int libxl__arch_domain_create(libxl__gc *gc, libxl_domain_config *d_config,
         xc_domain_set_time_offset(ctx->xch, domid, rtc_timeoffset);
 
     if (d_config->b_info.type != LIBXL_DOMAIN_TYPE_PV) {
-        unsigned long shadow = DIV_ROUNDUP(d_config->b_info.shadow_memkb,
-                                           1024);
-        xc_shadow_control(ctx->xch, domid, XEN_DOMCTL_SHADOW_OP_SET_ALLOCATION,
-                          NULL, 0, &shadow, 0, NULL);
+        unsigned long shadow_mb = DIV_ROUNDUP(d_config->b_info.shadow_memkb,
+                                              1024);
+        int r = xc_shadow_control(ctx->xch, domid,
+                                  XEN_DOMCTL_SHADOW_OP_SET_ALLOCATION,
+                                  NULL, 0, &shadow_mb, 0, NULL);
+
+        if (r) {
+            LOGED(ERROR, domid,
+                  "Failed to set %lu MiB %s allocation",
+                  shadow_mb,
+                  libxl_defbool_val(d_config->c_info.hap) ? "HAP" : "shadow");
+            ret = ERROR_FAIL;
+            goto out;
+        }
     }
 
     if (d_config->c_info.type == LIBXL_DOMAIN_TYPE_PV &&
@@ -671,6 +681,18 @@ int libxl__arch_passthrough_mode_setdefault(libxl__gc *gc,
     return rc;
 }
 
+unsigned long libxl__arch_get_required_paging_memory(unsigned long maxmem_kb,
+                                                     unsigned int smp_cpus)
+{
+    /*
+     * 256 pages (1MB) per vcpu,
+     * plus 1 page per MiB of RAM for the P2M map,
+     * plus 1 page per MiB of RAM to shadow the resident processes.
+     * This is higher than the minimum that Xen would allocate if no value
+     * were given (but the Xen minimum is for safety, not performance).
+     */
+    return 4 * (256 * smp_cpus + 2 * (maxmem_kb / 1024));
+}
 
 /*
  * Local variables:

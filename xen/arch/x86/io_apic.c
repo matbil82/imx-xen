@@ -28,6 +28,8 @@
 #include <xen/acpi.h>
 #include <xen/keyhandler.h>
 #include <xen/softirq.h>
+
+#include <asm/hpet.h>
 #include <asm/mc146818rtc.h>
 #include <asm/smp.h>
 #include <asm/desc.h>
@@ -1928,6 +1930,35 @@ static void __init check_timer(void)
             local_irq_restore(flags);
             return;
         }
+
+        /*
+         * Intel chipsets from Skylake/ApolloLake onwards can statically clock
+         * gate the 8254 PIT.  This option is enabled by default in slightly
+         * later systems, as turning the PIT off is a prerequisite to entering
+         * the C11 power saving state.
+         *
+         * Xen currently depends on the legacy timer interrupt being active
+         * while IRQ routing is configured.
+         *
+         * If the user hasn't made an explicit choice, attempt to reconfigure
+         * the HPET into legacy mode to re-establish the timer interrupt.
+         */
+        if ( opt_hpet_legacy_replacement < 0 &&
+             hpet_enable_legacy_replacement_mode() )
+        {
+            printk(XENLOG_ERR "..no 8254 timer found - trying HPET Legacy Replacement Mode\n");
+
+            if ( timer_irq_works() )
+            {
+                local_irq_restore(flags);
+                return;
+            }
+
+            /* Legacy Replacement mode hasn't helped.  Undo it. */
+            printk(XENLOG_ERR "..no HPET timer found - reverting Legacy Replacement Mode\n");
+            hpet_disable_legacy_replacement_mode();
+        }
+
         clear_IO_APIC_pin(apic1, pin1);
         printk(KERN_ERR "..MP-BIOS bug: 8254 timer not connected to "
                "IO-APIC\n");
@@ -2542,7 +2573,7 @@ void __init init_ioapic_mappings(void)
 
     if ( smp_found_config )
         nr_irqs_gsi = 0;
-    for ( i = 0; i < nr_ioapics; i++ )
+    for ( i = 0; i < nr_ioapics; i++, idx++ )
     {
         if ( smp_found_config )
         {
@@ -2565,7 +2596,6 @@ void __init init_ioapic_mappings(void)
         set_fixmap_nocache(idx, ioapic_phys);
         apic_printk(APIC_VERBOSE, "mapped IOAPIC to %08Lx (%08lx)\n",
                     __fix_to_virt(idx), ioapic_phys);
-        idx++;
 
         if ( bad_ioapic_register(i) )
         {

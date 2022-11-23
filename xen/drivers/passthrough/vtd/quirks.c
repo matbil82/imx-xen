@@ -267,26 +267,42 @@ static int __init parse_snb_timeout(const char *s)
 }
 custom_param("snb_igd_quirk", parse_snb_timeout);
 
-/* 5500/5520/X58 Chipset Interrupt remapping errata, for stepping B-3.
- * Fixed in stepping C-2. */
+/*
+ * 5500/5520/X58 chipset interrupt remapping errata, for steppings B2 and B3.
+ * Fixed in stepping C2 except on X58.
+ */
 static void __init tylersburg_intremap_quirk(void)
 {
-    uint32_t bus, device;
+    unsigned int bus;
     uint8_t rev;
 
     for ( bus = 0; bus < 0x100; bus++ )
     {
-        /* Match on System Management Registers on Device 20 Function 0 */
-        device = pci_conf_read32(PCI_SBDF(0, bus, 20, 0), PCI_VENDOR_ID);
-        rev = pci_conf_read8(PCI_SBDF(0, bus, 20, 0), PCI_REVISION_ID);
+        /* Match on DMI port (Device 0 Function 0) */
+        rev = pci_conf_read8(PCI_SBDF(0, bus, 0, 0), PCI_REVISION_ID);
 
-        if ( rev == 0x13 && device == 0x342e8086 )
+        switch ( pci_conf_read32(PCI_SBDF(0, bus, 0, 0), PCI_VENDOR_ID) )
         {
+        default:
+            continue;
+
+        case 0x34038086: case 0x34068086:
+            if ( rev >= 0x22 )
+                continue;
             printk(XENLOG_WARNING VTDPREFIX
-                   "Disabling IOMMU due to Intel 5500/5520/X58 Chipset errata #47, #53\n");
-            iommu_enable = 0;
+                   "Disabling IOMMU due to Intel 5500/5520 chipset errata #47 and #53\n");
+            iommu_enable = false;
+            break;
+
+        case 0x34058086:
+            printk(XENLOG_WARNING VTDPREFIX
+                   "Disabling IOMMU due to Intel X58 chipset %s\n",
+                   rev < 0x22 ? "errata #62 and #69" : "erratum #69");
+            iommu_enable = false;
             break;
         }
+
+        break;
     }
 }
 
@@ -327,7 +343,10 @@ void __init platform_quirks_init(void)
  */
 
 static int __must_check map_me_phantom_function(struct domain *domain,
-                                                u32 dev, int map)
+                                                unsigned int dev,
+                                                domid_t domid,
+                                                paddr_t pgd_maddr,
+                                                unsigned int mode)
 {
     struct acpi_drhd_unit *drhd;
     struct pci_dev *pdev;
@@ -338,9 +357,10 @@ static int __must_check map_me_phantom_function(struct domain *domain,
     drhd = acpi_find_matched_drhd_unit(pdev);
 
     /* map or unmap ME phantom function */
-    if ( map )
+    if ( !(mode & UNMAP_ME_PHANTOM_FUNC) )
         rc = domain_context_mapping_one(domain, drhd->iommu, 0,
-                                        PCI_DEVFN(dev, 7), NULL);
+                                        PCI_DEVFN(dev, 7), NULL,
+                                        domid, pgd_maddr, mode);
     else
         rc = domain_context_unmap_one(domain, drhd->iommu, 0,
                                       PCI_DEVFN(dev, 7));
@@ -348,7 +368,8 @@ static int __must_check map_me_phantom_function(struct domain *domain,
     return rc;
 }
 
-int me_wifi_quirk(struct domain *domain, u8 bus, u8 devfn, int map)
+int me_wifi_quirk(struct domain *domain, uint8_t bus, uint8_t devfn,
+                  domid_t domid, paddr_t pgd_maddr, unsigned int mode)
 {
     u32 id;
     int rc = 0;
@@ -372,7 +393,7 @@ int me_wifi_quirk(struct domain *domain, u8 bus, u8 devfn, int map)
             case 0x423b8086:
             case 0x423c8086:
             case 0x423d8086:
-                rc = map_me_phantom_function(domain, 3, map);
+                rc = map_me_phantom_function(domain, 3, domid, pgd_maddr, mode);
                 break;
             default:
                 break;
@@ -398,7 +419,7 @@ int me_wifi_quirk(struct domain *domain, u8 bus, u8 devfn, int map)
             case 0x42388086:        /* Puma Peak */
             case 0x422b8086:
             case 0x422c8086:
-                rc = map_me_phantom_function(domain, 22, map);
+                rc = map_me_phantom_function(domain, 22, domid, pgd_maddr, mode);
                 break;
             default:
                 break;

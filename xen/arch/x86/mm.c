@@ -786,24 +786,6 @@ bool is_iomem_page(mfn_t mfn)
     return (page_get_owner(page) == dom_io);
 }
 
-static int update_xen_mappings(unsigned long mfn, unsigned int cacheattr)
-{
-    int err = 0;
-    bool alias = mfn >= PFN_DOWN(xen_phys_start) &&
-         mfn < PFN_UP(xen_phys_start + xen_virt_end - XEN_VIRT_START);
-    unsigned long xen_va =
-        XEN_VIRT_START + ((mfn - PFN_DOWN(xen_phys_start)) << PAGE_SHIFT);
-
-    if ( unlikely(alias) && cacheattr )
-        err = map_pages_to_xen(xen_va, _mfn(mfn), 1, 0);
-    if ( !err )
-        err = map_pages_to_xen((unsigned long)mfn_to_virt(mfn), _mfn(mfn), 1,
-                     PAGE_HYPERVISOR | cacheattr_to_pte_flags(cacheattr));
-    if ( unlikely(alias) && !cacheattr && !err )
-        err = map_pages_to_xen(xen_va, _mfn(mfn), 1, PAGE_HYPERVISOR);
-    return err;
-}
-
 #ifndef NDEBUG
 struct mmio_emul_range_ctxt {
     const struct domain *d;
@@ -1008,48 +990,24 @@ get_page_from_l1e(
         goto could_not_pin;
     }
 
-    if ( pte_flags_to_cacheattr(l1f) !=
-         ((page->count_info & PGC_cacheattr_mask) >> PGC_cacheattr_base) )
+    if ( (l1f & PAGE_CACHE_ATTRS) != _PAGE_WB && is_xen_heap_page(page) )
     {
-        unsigned long x, nx, y = page->count_info;
-        unsigned long cacheattr = pte_flags_to_cacheattr(l1f);
-        int err;
-
-        if ( is_xen_heap_page(page) )
-        {
-            if ( write )
-                put_page_type(page);
-            put_page(page);
-            gdprintk(XENLOG_WARNING,
-                     "Attempt to change cache attributes of Xen heap page\n");
-            return -EACCES;
-        }
-
-        do {
-            x  = y;
-            nx = (x & ~PGC_cacheattr_mask) | (cacheattr << PGC_cacheattr_base);
-        } while ( (y = cmpxchg(&page->count_info, x, nx)) != x );
-
-        err = update_xen_mappings(mfn, cacheattr);
-        if ( unlikely(err) )
-        {
-            cacheattr = y & PGC_cacheattr_mask;
-            do {
-                x  = y;
-                nx = (x & ~PGC_cacheattr_mask) | cacheattr;
-            } while ( (y = cmpxchg(&page->count_info, x, nx)) != x );
-
-            if ( write )
-                put_page_type(page);
-            put_page(page);
-
-            gdprintk(XENLOG_WARNING, "Error updating mappings for mfn %" PRI_mfn
-                     " (pfn %" PRI_pfn ", from L1 entry %" PRIpte ") for d%d\n",
-                     mfn, get_gpfn_from_mfn(mfn),
-                     l1e_get_intpte(l1e), l1e_owner->domain_id);
-            return err;
-        }
+        if ( write )
+            put_page_type(page);
+        put_page(page);
+        gdprintk(XENLOG_WARNING,
+                 "Attempt to change cache attributes of Xen heap page\n");
+        return -EACCES;
     }
+
+    /*
+     * Track writeable non-coherent mappings to RAM pages, to trigger a cache
+     * flush later if the target is used as anything but a PGT_writeable page.
+     * We care about all writeable mappings, including foreign mappings.
+     */
+    if ( !boot_cpu_has(X86_FEATURE_XEN_SELFSNOOP) &&
+         (l1f & (PAGE_CACHE_ATTRS | _PAGE_RW)) == (_PAGE_WC | _PAGE_RW) )
+        set_bit(_PGT_non_coherent, &page->u.inuse.type_info);
 
     return 0;
 
@@ -1236,8 +1194,14 @@ void put_page_from_l1e(l1_pgentry_t l1e, struct domain *l1e_owner)
      *
      * (Note that the undestroyable active grants are not a security hole in
      * Xen. All active grants can safely be cleaned up when the domain dies.)
+     *
+     * NB: the preprocessor conditional is required in order to prevent clang's
+     * -Wtautological-constant-compare complaining about converting the result
+     * of a << into a bool is always true if it's evaluated directly in the if
+     * condition.
      */
-    if ( _PAGE_GNTTAB && (l1e_get_flags(l1e) & _PAGE_GNTTAB) &&
+#if _PAGE_GNTTAB
+    if ( (l1e_get_flags(l1e) & _PAGE_GNTTAB) &&
          !l1e_owner->is_shutting_down && !l1e_owner->is_dying )
     {
         gdprintk(XENLOG_WARNING,
@@ -1245,6 +1209,7 @@ void put_page_from_l1e(l1_pgentry_t l1e, struct domain *l1e_owner)
                  l1e_get_intpte(l1e));
         domain_crash(l1e_owner);
     }
+#endif
 
     /*
      * Remember we didn't take a type-count of foreign writable mappings
@@ -2160,6 +2125,50 @@ void page_unlock(struct page_info *page)
     current_locked_page_set(NULL);
 }
 
+/*
+ * L3 table locks:
+ *
+ * Used for serialization in map_pages_to_xen() and modify_xen_mappings().
+ *
+ * For Xen PT pages, the page->u.inuse.type_info is unused and it is safe to
+ * reuse the PGT_locked flag. This lock is taken only when we move down to L3
+ * tables and below, since L4 (and above, for 5-level paging) is still globally
+ * protected by map_pgdir_lock.
+ *
+ * PV MMU update hypercalls call map_pages_to_xen while holding a page's page_lock().
+ * This has two implications:
+ * - We cannot reuse reuse current_locked_page_* for debugging
+ * - To avoid the chance of deadlock, even for different pages, we
+ *   must never grab page_lock() after grabbing l3t_lock().  This
+ *   includes any page_lock()-based locks, such as
+ *   mem_sharing_page_lock().
+ *
+ * Also note that we grab the map_pgdir_lock while holding the
+ * l3t_lock(), so to avoid deadlock we must avoid grabbing them in
+ * reverse order.
+ */
+static void l3t_lock(struct page_info *page)
+{
+    unsigned long x, nx;
+
+    do {
+        while ( (x = page->u.inuse.type_info) & PGT_locked )
+            cpu_relax();
+        nx = x | PGT_locked;
+    } while ( cmpxchg(&page->u.inuse.type_info, x, nx) != x );
+}
+
+static void l3t_unlock(struct page_info *page)
+{
+    unsigned long x, nx, y = page->u.inuse.type_info;
+
+    do {
+        x = y;
+        BUG_ON(!(x & PGT_locked));
+        nx = x & ~PGT_locked;
+    } while ( (y = cmpxchg(&page->u.inuse.type_info, x, nx)) != x );
+}
+
 #ifdef CONFIG_PV
 /*
  * PTE flags that a guest may change without re-validating the PTE.
@@ -2490,23 +2499,8 @@ static int mod_l4_entry(l4_pgentry_t *pl4e,
  */
 static int cleanup_page_mappings(struct page_info *page)
 {
-    unsigned int cacheattr =
-        (page->count_info & PGC_cacheattr_mask) >> PGC_cacheattr_base;
     int rc = 0;
     unsigned long mfn = mfn_x(page_to_mfn(page));
-
-    /*
-     * If we've modified xen mappings as a result of guest cache
-     * attributes, restore them to the "normal" state.
-     */
-    if ( unlikely(cacheattr) )
-    {
-        page->count_info &= ~PGC_cacheattr_mask;
-
-        BUG_ON(is_xen_heap_page(page));
-
-        rc = update_xen_mappings(mfn, 0);
-    }
 
     /*
      * If this may be in a PV domain's IOMMU, remove it.
@@ -2545,6 +2539,19 @@ static int cleanup_page_mappings(struct page_info *page)
             if ( likely(!rc) )
                 page->u.inuse.type_info &= ~(PGT_type_mask | PGT_count_mask);
         }
+    }
+
+    /*
+     * Flush the cache if there were previously non-coherent writeable
+     * mappings of this page.  This forces the page to be coherent before it
+     * is freed back to the heap.
+     */
+    if ( __test_and_clear_bit(_PGT_non_coherent, &page->u.inuse.type_info) )
+    {
+        void *addr = __map_domain_page(page);
+
+        cache_flush(addr, PAGE_SIZE);
+        unmap_domain_page(addr);
     }
 
     return rc;
@@ -2927,16 +2934,17 @@ static int _put_page_type(struct page_info *page, unsigned int flags,
 static int _get_page_type(struct page_info *page, unsigned long type,
                           bool preemptible)
 {
-    unsigned long nx, x, y = page->u.inuse.type_info;
+    unsigned long nx, x;
     int rc = 0;
 
     ASSERT(!(type & ~(PGT_type_mask | PGT_pae_xen_l2)));
     ASSERT(!in_irq());
 
-    for ( ; ; )
+    for ( unsigned long y = ACCESS_ONCE(page->u.inuse.type_info); ; )
     {
         x  = y;
         nx = x + 1;
+
         if ( unlikely((nx & PGT_count_mask) == 0) )
         {
             gdprintk(XENLOG_WARNING,
@@ -2944,53 +2952,33 @@ static int _get_page_type(struct page_info *page, unsigned long type,
                      mfn_x(page_to_mfn(page)));
             return -EINVAL;
         }
-        else if ( unlikely((x & PGT_count_mask) == 0) )
-        {
-            struct domain *d = page_get_owner(page);
 
-            if ( d && shadow_mode_enabled(d) )
-               shadow_prepare_page_type_change(d, page, type);
+        if ( unlikely((x & PGT_count_mask) == 0) )
+        {
+            /*
+             * Typeref 0 -> 1.
+             *
+             * Type changes are permitted when the typeref is 0.  If the type
+             * actually changes, the page needs re-validating.
+             */
 
             ASSERT(!(x & PGT_pae_xen_l2));
             if ( (x & PGT_type_mask) != type )
             {
-                /*
-                 * On type change we check to flush stale TLB entries. It is
-                 * vital that no other CPUs are left with mappings of a frame
-                 * which is about to become writeable to the guest.
-                 */
-                cpumask_t *mask = this_cpu(scratch_cpumask);
-
-                BUG_ON(in_irq());
-                cpumask_copy(mask, d->dirty_cpumask);
-
-                /* Don't flush if the timestamp is old enough */
-                tlbflush_filter(mask, page->tlbflush_timestamp);
-
-                if ( unlikely(!cpumask_empty(mask)) &&
-                     /* Shadow mode: track only writable pages. */
-                     (!shadow_mode_enabled(page_get_owner(page)) ||
-                      ((nx & PGT_type_mask) == PGT_writable_page)) )
-                {
-                    perfc_incr(need_flush_tlb_flush);
-                    flush_tlb_mask(mask);
-                }
-
-                /* We lose existing type and validity. */
                 nx &= ~(PGT_type_mask | PGT_validated);
                 nx |= type;
-
-                /*
-                 * No special validation needed for writable pages.
-                 * Page tables and GDT/LDT need to be scanned for validity.
-                 */
-                if ( type == PGT_writable_page || type == PGT_shared_page )
-                    nx |= PGT_validated;
             }
         }
         else if ( unlikely((x & (PGT_type_mask|PGT_pae_xen_l2)) != type) )
         {
-            /* Don't log failure if it could be a recursive-mapping attempt. */
+            /*
+             * else, we're trying to take a new reference, of the wrong type.
+             *
+             * This (being able to prohibit use of the wrong type) is what the
+             * typeref system exists for, but skip printing the failure if it
+             * looks like a recursive mapping, as subsequent logic might
+             * ultimately permit the attempt.
+             */
             if ( ((x & PGT_type_mask) == PGT_l2_page_table) &&
                  (type == PGT_l1_page_table) )
                 return -EINVAL;
@@ -3009,18 +2997,47 @@ static int _get_page_type(struct page_info *page, unsigned long type,
         }
         else if ( unlikely(!(x & PGT_validated)) )
         {
+            /*
+             * else, the count is non-zero, and we're grabbing the right type;
+             * but the page hasn't been validated yet.
+             *
+             * The page is in one of two states (depending on PGT_partial),
+             * and should have exactly one reference.
+             */
+            ASSERT((x & (PGT_type_mask | PGT_pae_xen_l2 | PGT_count_mask)) ==
+                   (type | 1));
+
             if ( !(x & PGT_partial) )
             {
-                /* Someone else is updating validation of this page. Wait... */
+                /*
+                 * The page has been left in the "validate locked" state
+                 * (i.e. PGT_[type] | 1) which means that a concurrent caller
+                 * of _get_page_type() is in the middle of validation.
+                 *
+                 * Spin waiting for the concurrent user to complete (partial
+                 * or fully validated), then restart our attempt to acquire a
+                 * type reference.
+                 */
                 do {
                     if ( preemptible && hypercall_preempt_check() )
                         return -EINTR;
                     cpu_relax();
-                } while ( (y = page->u.inuse.type_info) == x );
+                } while ( (y = ACCESS_ONCE(page->u.inuse.type_info)) == x );
                 continue;
             }
-            /* Type ref count was left at 1 when PGT_partial got set. */
-            ASSERT((x & PGT_count_mask) == 1);
+
+            /*
+             * The page has been left in the "partial" state
+             * (i.e., PGT_[type] | PGT_partial | 1).
+             *
+             * Rather than bumping the type count, we need to try to grab the
+             * validation lock; if we succeed, we need to validate the page,
+             * then drop the general ref associated with the PGT_partial bit.
+             *
+             * We grab the validation lock by setting nx to (PGT_[type] | 1)
+             * (i.e., non-zero type count, neither PGT_validated nor
+             * PGT_partial set).
+             */
             nx = x & ~PGT_partial;
         }
 
@@ -3029,6 +3046,46 @@ static int _get_page_type(struct page_info *page, unsigned long type,
 
         if ( preemptible && hypercall_preempt_check() )
             return -EINTR;
+    }
+
+    /*
+     * One typeref has been taken and is now globally visible.
+     *
+     * The page is either in the "validate locked" state (PGT_[type] | 1) or
+     * fully validated (PGT_[type] | PGT_validated | >0).
+     */
+
+    if ( unlikely((x & PGT_count_mask) == 0) )
+    {
+        struct domain *d = page_get_owner(page);
+
+        if ( d && shadow_mode_enabled(d) )
+            shadow_prepare_page_type_change(d, page, type);
+
+        if ( (x & PGT_type_mask) != type )
+        {
+            /*
+             * On type change we check to flush stale TLB entries. It is
+             * vital that no other CPUs are left with writeable mappings
+             * to a frame which is intending to become pgtable/segdesc.
+             */
+            cpumask_t *mask = this_cpu(scratch_cpumask);
+
+            BUG_ON(in_irq());
+            cpumask_copy(mask, d->dirty_cpumask);
+
+            /* Don't flush if the timestamp is old enough */
+            tlbflush_filter(mask, page->tlbflush_timestamp);
+
+            if ( unlikely(!cpumask_empty(mask)) &&
+                 /* Shadow mode: track only writable pages. */
+                 (!shadow_mode_enabled(d) ||
+                  ((x & PGT_type_mask) == PGT_writable_page)) )
+            {
+                perfc_incr(need_flush_tlb_flush);
+                flush_tlb_mask(mask);
+            }
+        }
     }
 
     if ( unlikely((x & PGT_type_mask) != type) )
@@ -3055,16 +3112,51 @@ static int _get_page_type(struct page_info *page, unsigned long type,
 
     if ( unlikely(!(nx & PGT_validated)) )
     {
-        if ( !(x & PGT_partial) )
+        /*
+         * Flush the cache if there were previously non-coherent mappings of
+         * this page, and we're trying to use it as anything other than a
+         * writeable page.  This forces the page to be coherent before we
+         * validate its contents for safety.
+         */
+        if ( (nx & PGT_non_coherent) && type != PGT_writable_page )
         {
-            page->nr_validated_ptes = 0;
-            page->partial_flags = 0;
-            page->linear_pt_count = 0;
+            void *addr = __map_domain_page(page);
+
+            cache_flush(addr, PAGE_SIZE);
+            unmap_domain_page(addr);
+
+            page->u.inuse.type_info &= ~PGT_non_coherent;
         }
-        rc = alloc_page_type(page, type, preemptible);
+
+        /*
+         * No special validation needed for writable or shared pages.  Page
+         * tables and GDT/LDT need to have their contents audited.
+         *
+         * per validate_page(), non-atomic updates are fine here.
+         */
+        if ( type == PGT_writable_page || type == PGT_shared_page )
+            page->u.inuse.type_info |= PGT_validated;
+        else
+        {
+            if ( !(x & PGT_partial) )
+            {
+                page->nr_validated_ptes = 0;
+                page->partial_flags = 0;
+                page->linear_pt_count = 0;
+            }
+
+            rc = alloc_page_type(page, type, preemptible);
+        }
     }
 
  out:
+    /*
+     * Did we drop the PGT_partial bit when acquiring the typeref?  If so,
+     * drop the general reference that went along with it.
+     *
+     * N.B. validate_page() may have have re-set PGT_partial, not reflected in
+     * nx, but will have taken an extra ref when doing so.
+     */
     if ( (x & PGT_partial) && !(nx & PGT_partial) )
         put_page(page);
 
@@ -3918,7 +4010,8 @@ long do_mmu_update(
     struct vcpu *curr = current, *v = curr;
     struct domain *d = v->domain, *pt_owner = d, *pg_owner;
     mfn_t map_mfn = INVALID_MFN, mfn;
-    bool sync_guest = false;
+    bool flush_linear_pt = false, flush_root_pt_local = false,
+        flush_root_pt_others = false;
     uint32_t xsm_needed = 0;
     uint32_t xsm_checked = 0;
     int rc = put_old_guest_table(curr);
@@ -4068,6 +4161,8 @@ long do_mmu_update(
                         break;
                     rc = mod_l2_entry(va, l2e_from_intpte(req.val), mfn,
                                       cmd == MMU_PT_UPDATE_PRESERVE_AD, v);
+                    if ( !rc )
+                        flush_linear_pt = true;
                     break;
 
                 case PGT_l3_page_table:
@@ -4075,6 +4170,8 @@ long do_mmu_update(
                         break;
                     rc = mod_l3_entry(va, l3e_from_intpte(req.val), mfn,
                                       cmd == MMU_PT_UPDATE_PRESERVE_AD, v);
+                    if ( !rc )
+                        flush_linear_pt = true;
                     break;
 
                 case PGT_l4_page_table:
@@ -4082,6 +4179,8 @@ long do_mmu_update(
                         break;
                     rc = mod_l4_entry(va, l4e_from_intpte(req.val), mfn,
                                       cmd == MMU_PT_UPDATE_PRESERVE_AD, v);
+                    if ( !rc )
+                        flush_linear_pt = true;
                     if ( !rc && pt_owner->arch.pv.xpti )
                     {
                         bool local_in_use = false;
@@ -4090,7 +4189,7 @@ long do_mmu_update(
                                     mfn) )
                         {
                             local_in_use = true;
-                            get_cpu_info()->root_pgt_changed = true;
+                            flush_root_pt_local = true;
                         }
 
                         /*
@@ -4102,7 +4201,7 @@ long do_mmu_update(
                              (1 + !!(page->u.inuse.type_info & PGT_pinned) +
                               mfn_eq(pagetable_get_mfn(curr->arch.guest_table_user),
                                      mfn) + local_in_use) )
-                            sync_guest = true;
+                            flush_root_pt_others = true;
                     }
                     break;
 
@@ -4204,19 +4303,61 @@ long do_mmu_update(
     if ( va )
         unmap_domain_page(va);
 
-    if ( sync_guest )
+    /*
+     * Perform required TLB maintenance.
+     *
+     * This logic currently depend on flush_linear_pt being a superset of the
+     * flush_root_pt_* conditions.
+     *
+     * pt_owner may not be current->domain.  This may occur during
+     * construction of 32bit PV guests, or debugging of PV guests.  The
+     * behaviour cannot be correct with domain unpaused.  We therefore expect
+     * pt_owner->dirty_cpumask to be empty, but it is a waste of effort to
+     * explicitly check for, and exclude, this corner case.
+     *
+     * flush_linear_pt requires a FLUSH_TLB to all dirty CPUs.  The flush must
+     * be performed now to maintain correct behaviour across a multicall.
+     * i.e. we cannot relax FLUSH_TLB to FLUSH_ROOT_PGTBL, given that the
+     * former is a side effect of the latter, because the resync (which is in
+     * the return-to-guest path) happens too late.
+     *
+     * flush_root_pt_* requires FLUSH_ROOT_PGTBL on either the local CPU
+     * (implies pt_owner == current->domain and current->processor set in
+     * pt_owner->dirty_cpumask), and/or all *other* dirty CPUs as there are
+     * references we can't account for locally.
+     */
+    if ( flush_linear_pt /* || flush_root_pt_local || flush_root_pt_others */ )
     {
-        /*
-         * Force other vCPU-s of the affected guest to pick up L4 entry
-         * changes (if any).
-         */
         unsigned int cpu = smp_processor_id();
-        cpumask_t *mask = per_cpu(scratch_cpumask, cpu);
+        cpumask_t *mask = pt_owner->dirty_cpumask;
 
-        cpumask_andnot(mask, pt_owner->dirty_cpumask, cpumask_of(cpu));
+        /*
+         * Always handle local flushing separately (if applicable), to
+         * separate the flush invocations appropriately for scope of the two
+         * flush_root_pt_* variables.
+         */
+        if ( likely(cpumask_test_cpu(cpu, mask)) )
+        {
+            mask = per_cpu(scratch_cpumask, cpu);
+
+            cpumask_copy(mask, pt_owner->dirty_cpumask);
+            __cpumask_clear_cpu(cpu, mask);
+
+            flush_local(FLUSH_TLB |
+                        (flush_root_pt_local ? FLUSH_ROOT_PGTBL : 0));
+        }
+        else
+            /* Sanity check.  flush_root_pt_local implies local cpu is dirty. */
+            ASSERT(!flush_root_pt_local);
+
+        /* Flush the remote dirty CPUs.  Does not include the local CPU. */
         if ( !cpumask_empty(mask) )
-            flush_mask(mask, FLUSH_TLB_GLOBAL | FLUSH_ROOT_PGTBL);
+            flush_mask(mask, FLUSH_TLB |
+                       (flush_root_pt_others ? FLUSH_ROOT_PGTBL : 0));
     }
+    else
+        /* Sanity check.  flush_root_pt_* implies flush_linear_pt. */
+        ASSERT(!flush_root_pt_local && !flush_root_pt_others);
 
     perfc_add(num_page_updates, i);
 
@@ -4617,7 +4758,7 @@ static int handle_iomem_range(unsigned long s, unsigned long e, void *p)
 int xenmem_add_to_physmap_one(
     struct domain *d,
     unsigned int space,
-    union xen_add_to_physmap_batch_extra extra,
+    union add_to_physmap_extra extra,
     unsigned long idx,
     gfn_t gpfn)
 {
@@ -4638,6 +4779,8 @@ int xenmem_add_to_physmap_one(
             rc = gnttab_map_frame(d, idx, gpfn, &mfn);
             if ( rc )
                 return rc;
+            /* Need to take care of the ref obtained in gnttab_map_frame(). */
+            page = mfn_to_page(mfn);
             break;
         case XENMAPSPACE_gmfn:
         {
@@ -4668,9 +4811,23 @@ int xenmem_add_to_physmap_one(
         goto put_both;
     }
 
-    /* Remove previously mapped page if it was present. */
+    /*
+     * Note that we're (ab)using GFN locking (to really be locking of the
+     * entire P2M) here in (at least) two ways: Finer grained locking would
+     * expose lock order violations in the XENMAPSPACE_gmfn case (due to the
+     * earlier get_gfn_unshare() above). Plus at the very least for the grant
+     * table v2 status page case we need to guarantee that the same page can
+     * only appear at a single GFN. While this is a property we want in
+     * general, for pages which can subsequently be freed this imperative:
+     * Upon freeing we wouldn't be able to find other mappings in the P2M
+     * (unless we did a brute force search).
+     */
     prev_mfn = get_gfn(d, gfn_x(gpfn), &p2mt);
-    if ( mfn_valid(prev_mfn) )
+
+    /* Remove previously mapped page if it was present. */
+    if ( p2mt == p2m_mmio_direct )
+        rc = -EPERM;
+    else if ( mfn_valid(prev_mfn) )
     {
         if ( is_xen_heap_mfn(prev_mfn) )
             /* Xen heap frames are simply unhooked from this phys slot. */
@@ -4679,31 +4836,36 @@ int xenmem_add_to_physmap_one(
             /* Normal domain memory is freed, to avoid leaking memory. */
             rc = guest_remove_page(d, gfn_x(gpfn));
     }
-    /* In the XENMAPSPACE_gmfn case we still hold a ref on the old page. */
-    put_gfn(d, gfn_x(gpfn));
-
-    if ( rc )
-        goto put_both;
 
     /* Unmap from old location, if any. */
     old_gpfn = get_gpfn_from_mfn(mfn_x(mfn));
     ASSERT(!SHARED_M2P(old_gpfn));
     if ( space == XENMAPSPACE_gmfn && old_gpfn != gfn )
-    {
         rc = -EXDEV;
-        goto put_both;
-    }
-    if ( old_gpfn != INVALID_M2P_ENTRY )
+    else if ( !rc && old_gpfn != INVALID_M2P_ENTRY )
         rc = guest_physmap_remove_page(d, _gfn(old_gpfn), mfn, PAGE_ORDER_4K);
 
     /* Map at new location. */
     if ( !rc )
         rc = guest_physmap_add_page(d, gpfn, mfn, PAGE_ORDER_4K);
 
+    put_gfn(d, gfn_x(gpfn));
+
  put_both:
-    /* In the XENMAPSPACE_gmfn case, we took a ref of the gfn at the top. */
+    /*
+     * In the XENMAPSPACE_gmfn case, we took a ref of the gfn at the top.
+     * We also may need to transfer ownership of the page reference to our
+     * caller.
+     */
     if ( space == XENMAPSPACE_gmfn )
+    {
         put_gfn(d, gfn);
+        if ( !rc && extra.ppage )
+        {
+            *extra.ppage = page;
+            page = NULL;
+        }
+    }
 
     if ( page )
         put_page(page);
@@ -5170,6 +5332,23 @@ l1_pgentry_t *virt_to_xen_l1e(unsigned long v)
                          flush_area_local((const void *)v, f) : \
                          flush_area_all((const void *)v, f))
 
+#define L3T_INIT(page) (page) = ZERO_BLOCK_PTR
+
+#define L3T_LOCK(page)        \
+    do {                      \
+        if ( locking )        \
+            l3t_lock(page);   \
+    } while ( false )
+
+#define L3T_UNLOCK(page)                           \
+    do {                                           \
+        if ( locking && (page) != ZERO_BLOCK_PTR ) \
+        {                                          \
+            l3t_unlock(page);                      \
+            (page) = ZERO_BLOCK_PTR;               \
+        }                                          \
+    } while ( false )
+
 int map_pages_to_xen(
     unsigned long virt,
     mfn_t mfn,
@@ -5180,6 +5359,8 @@ int map_pages_to_xen(
     l2_pgentry_t *pl2e, ol2e;
     l1_pgentry_t *pl1e, ol1e;
     unsigned int  i;
+    int rc = -ENOMEM;
+    struct page_info *current_l3page;
 
 #define flush_flags(oldf) do {                 \
     unsigned int o_ = (oldf);                  \
@@ -5195,12 +5376,20 @@ int map_pages_to_xen(
     }                                          \
 } while (0)
 
+    L3T_INIT(current_l3page);
+
     while ( nr_mfns != 0 )
     {
-        l3_pgentry_t ol3e, *pl3e = virt_to_xen_l3e(virt);
+        l3_pgentry_t *pl3e, ol3e;
 
+        L3T_UNLOCK(current_l3page);
+
+        pl3e = virt_to_xen_l3e(virt);
         if ( !pl3e )
-            return -ENOMEM;
+            goto out;
+
+        current_l3page = virt_to_page(pl3e);
+        L3T_LOCK(current_l3page);
         ol3e = *pl3e;
 
         if ( cpu_has_page1gb &&
@@ -5288,7 +5477,7 @@ int map_pages_to_xen(
 
             pl2e = alloc_xen_pagetable();
             if ( pl2e == NULL )
-                return -ENOMEM;
+                goto out;
 
             for ( i = 0; i < L2_PAGETABLE_ENTRIES; i++ )
                 l2e_write(pl2e + i,
@@ -5317,7 +5506,7 @@ int map_pages_to_xen(
 
         pl2e = virt_to_xen_l2e(virt);
         if ( !pl2e )
-            return -ENOMEM;
+            goto out;
 
         if ( ((((virt >> PAGE_SHIFT) | mfn_x(mfn)) &
                ((1u << PAGETABLE_ORDER) - 1)) == 0) &&
@@ -5360,7 +5549,7 @@ int map_pages_to_xen(
             {
                 pl1e = virt_to_xen_l1e(virt);
                 if ( pl1e == NULL )
-                    return -ENOMEM;
+                    goto out;
             }
             else if ( l2e_get_flags(*pl2e) & _PAGE_PSE )
             {
@@ -5387,7 +5576,7 @@ int map_pages_to_xen(
 
                 pl1e = alloc_xen_pagetable();
                 if ( pl1e == NULL )
-                    return -ENOMEM;
+                    goto out;
 
                 for ( i = 0; i < L1_PAGETABLE_ENTRIES; i++ )
                     l1e_write(&pl1e[i],
@@ -5531,7 +5720,11 @@ int map_pages_to_xen(
 
 #undef flush_flags
 
-    return 0;
+    rc = 0;
+
+ out:
+    L3T_UNLOCK(current_l3page);
+    return rc;
 }
 
 int populate_pt_range(unsigned long virt, unsigned long nr_mfns)
@@ -5558,6 +5751,8 @@ int modify_xen_mappings(unsigned long s, unsigned long e, unsigned int nf)
     l1_pgentry_t *pl1e;
     unsigned int  i;
     unsigned long v = s;
+    int rc = -ENOMEM;
+    struct page_info *current_l3page;
 
     /* Set of valid PTE bits which may be altered. */
 #define FLAGS_MASK (_PAGE_NX|_PAGE_RW|_PAGE_PRESENT)
@@ -5566,11 +5761,22 @@ int modify_xen_mappings(unsigned long s, unsigned long e, unsigned int nf)
     ASSERT(IS_ALIGNED(s, PAGE_SIZE));
     ASSERT(IS_ALIGNED(e, PAGE_SIZE));
 
+    L3T_INIT(current_l3page);
+
     while ( v < e )
     {
-        l3_pgentry_t *pl3e = virt_to_xen_l3e(v);
+        l3_pgentry_t *pl3e;
 
-        if ( !pl3e || !(l3e_get_flags(*pl3e) & _PAGE_PRESENT) )
+        L3T_UNLOCK(current_l3page);
+
+        pl3e = virt_to_xen_l3e(v);
+        if ( !pl3e )
+            goto out;
+
+        current_l3page = virt_to_page(pl3e);
+        L3T_LOCK(current_l3page);
+
+        if ( !(l3e_get_flags(*pl3e) & _PAGE_PRESENT) )
         {
             /* Confirm the caller isn't trying to create new mappings. */
             ASSERT(!(nf & _PAGE_PRESENT));
@@ -5599,7 +5805,8 @@ int modify_xen_mappings(unsigned long s, unsigned long e, unsigned int nf)
             /* PAGE1GB: shatter the superpage and fall through. */
             pl2e = alloc_xen_pagetable();
             if ( !pl2e )
-                return -ENOMEM;
+                goto out;
+
             for ( i = 0; i < L2_PAGETABLE_ENTRIES; i++ )
                 l2e_write(pl2e + i,
                           l2e_from_pfn(l3e_get_pfn(*pl3e) +
@@ -5654,7 +5861,8 @@ int modify_xen_mappings(unsigned long s, unsigned long e, unsigned int nf)
                 /* PSE: shatter the superpage and try again. */
                 pl1e = alloc_xen_pagetable();
                 if ( !pl1e )
-                    return -ENOMEM;
+                    goto out;
+
                 for ( i = 0; i < L1_PAGETABLE_ENTRIES; i++ )
                     l1e_write(&pl1e[i],
                               l1e_from_pfn(l2e_get_pfn(*pl2e) + i,
@@ -5783,8 +5991,15 @@ int modify_xen_mappings(unsigned long s, unsigned long e, unsigned int nf)
     flush_area(NULL, FLUSH_TLB_GLOBAL);
 
 #undef FLAGS_MASK
-    return 0;
+    rc = 0;
+
+ out:
+    L3T_UNLOCK(current_l3page);
+    return rc;
 }
+
+#undef L3T_LOCK
+#undef L3T_UNLOCK
 
 #undef flush_area
 

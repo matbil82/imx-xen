@@ -20,9 +20,6 @@
 #ifndef _ASM_X86_64_AMD_IOMMU_DEFS_H
 #define _ASM_X86_64_AMD_IOMMU_DEFS_H
 
-/* IOMMU Command Buffer entries: in power of 2 increments, minimum of 256 */
-#define IOMMU_CMD_BUFFER_DEFAULT_ENTRIES	512
-
 /* IOMMU Event Log entries: in power of 2 increments, minimum of 256 */
 #define IOMMU_EVENT_LOG_DEFAULT_ENTRIES     512
 
@@ -113,6 +110,7 @@ struct amd_iommu_dte {
     bool tv:1;
     unsigned int :5;
     unsigned int had:2;
+#define IOMMU_MAX_PT_LEVELS 6
     unsigned int paging_mode:3;
     uint64_t pt_root:40;
     bool ppr:1;
@@ -168,8 +166,8 @@ struct amd_iommu_dte {
 #define IOMMU_CMD_BUFFER_LENGTH_MASK		0x0F000000
 #define IOMMU_CMD_BUFFER_LENGTH_SHIFT		24
 
-#define IOMMU_CMD_BUFFER_ENTRY_SIZE			16
-#define IOMMU_CMD_BUFFER_POWER_OF2_ENTRIES_PER_PAGE	8
+#define IOMMU_CMD_BUFFER_ENTRY_ORDER            4
+#define IOMMU_CMD_BUFFER_MAX_ENTRIES            (1u << 15)
 
 #define IOMMU_CMD_OPCODE_MASK			0xF0000000
 #define IOMMU_CMD_OPCODE_SHIFT			28
@@ -465,20 +463,23 @@ union amd_iommu_x2apic_control {
 #define IOMMU_PAGE_TABLE_U32_PER_ENTRY	(IOMMU_PAGE_TABLE_ENTRY_SIZE / 4)
 #define IOMMU_PAGE_TABLE_ALIGNMENT	4096
 
-struct amd_iommu_pte {
-    uint64_t pr:1;
-    uint64_t ignored0:4;
-    uint64_t a:1;
-    uint64_t d:1;
-    uint64_t ignored1:2;
-    uint64_t next_level:3;
-    uint64_t mfn:40;
-    uint64_t reserved:7;
-    uint64_t u:1;
-    uint64_t fc:1;
-    uint64_t ir:1;
-    uint64_t iw:1;
-    uint64_t ignored2:1;
+union amd_iommu_pte {
+    uint64_t raw;
+    struct {
+        bool pr:1;
+        unsigned int ign0:4;
+        bool a:1;
+        bool d:1;
+        unsigned int ign1:2;
+        unsigned int next_level:3;
+        uint64_t mfn:40;
+        unsigned int :7;
+        bool u:1;
+        bool fc:1;
+        bool ir:1;
+        bool iw:1;
+        unsigned int ign2:1;
+    };
 };
 
 /* Paging modes */

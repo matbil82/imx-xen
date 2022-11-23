@@ -36,6 +36,7 @@
 #include <xen/iommu.h>
 #include <xen/paging.h>
 #include <xen/keyhandler.h>
+#include <xen/radix-tree.h>
 #include <xen/vmap.h>
 #include <xen/nospec.h>
 #include <xsm/xsm.h>
@@ -63,7 +64,13 @@ struct grant_table {
     unsigned int          nr_grant_frames;
     /* Number of grant status frames shared with guest (for version 2) */
     unsigned int          nr_status_frames;
-    /* Number of available maptrack entries. */
+    /*
+     * Number of available maptrack entries.  For cleanup purposes it is
+     * important to realize that this field and @maptrack further down will
+     * only ever be accessed by the local domain.  Thus it is okay to clean
+     * up early, and to shrink the limit for the purpose of tracking cleanup
+     * progress.
+     */
     unsigned int          maptrack_limit;
     /* Shared grant table (see include/public/grant_table.h). */
     union {
@@ -75,8 +82,13 @@ struct grant_table {
     grant_status_t       **status;
     /* Active grant table. */
     struct active_grant_entry **active;
-    /* Mapping tracking table per vcpu. */
+    /* Handle-indexed tracking table of mappings. */
     struct grant_mapping **maptrack;
+    /*
+     * MFN-indexed tracking tree of mappings, if needed.  Note that this is
+     * protected by @lock, not @maptrack_lock.
+     */
+    struct radix_tree_root maptrack_tree;
 
     /* Domain to which this struct grant_table belongs. */
     const struct domain *domain;
@@ -454,34 +466,6 @@ static int get_paged_frame(unsigned long gfn, mfn_t *mfn,
     return GNTST_okay;
 }
 
-static inline void
-double_gt_lock(struct grant_table *lgt, struct grant_table *rgt)
-{
-    /*
-     * See mapkind() for why the write lock is also required for the
-     * remote domain.
-     */
-    if ( lgt < rgt )
-    {
-        grant_write_lock(lgt);
-        grant_write_lock(rgt);
-    }
-    else
-    {
-        if ( lgt != rgt )
-            grant_write_lock(rgt);
-        grant_write_lock(lgt);
-    }
-}
-
-static inline void
-double_gt_unlock(struct grant_table *lgt, struct grant_table *rgt)
-{
-    grant_write_unlock(lgt);
-    if ( lgt != rgt )
-        grant_write_unlock(rgt);
-}
-
 #define INVALID_MAPTRACK_HANDLE UINT_MAX
 
 static inline grant_handle_t
@@ -795,9 +779,10 @@ static int _set_status_v2(const grant_entry_header_t *shah,
         mask |= GTF_sub_page;
 
     /* If not already pinned, check the grant domid and type. */
-    if ( !act->pin && ((((scombo.flags & mask) != GTF_permit_access) &&
-                        ((scombo.flags & mask) != GTF_transitive)) ||
-                       (scombo.domid != ldomid)) )
+    if ( !act->pin &&
+         ((((scombo.flags & mask) != GTF_permit_access) &&
+           (mapflag || ((scombo.flags & mask) != GTF_transitive))) ||
+          (scombo.domid != ldomid)) )
         PIN_FAIL(done, GNTST_general_error,
                  "Bad flags (%x) or dom (%d); expected d%d, flags %x\n",
                  scombo.flags, scombo.domid, ldomid, mask);
@@ -823,7 +808,7 @@ static int _set_status_v2(const grant_entry_header_t *shah,
     if ( !act->pin )
     {
         if ( (((scombo.flags & mask) != GTF_permit_access) &&
-              ((scombo.flags & mask) != GTF_transitive)) ||
+              (mapflag || ((scombo.flags & mask) != GTF_transitive))) ||
              (scombo.domid != ldomid) ||
              (!readonly && (scombo.flags & GTF_readonly)) )
         {
@@ -900,41 +885,20 @@ static struct active_grant_entry *grant_map_exists(const struct domain *ld,
     return ERR_PTR(-EINVAL);
 }
 
-#define MAPKIND_READ 1
-#define MAPKIND_WRITE 2
-static unsigned int mapkind(
-    struct grant_table *lgt, const struct domain *rd, mfn_t mfn)
-{
-    struct grant_mapping *map;
-    grant_handle_t handle, limit = lgt->maptrack_limit;
-    unsigned int kind = 0;
-
-    /*
-     * Must have the local domain's grant table write lock when
-     * iterating over its maptrack entries.
-     */
-    ASSERT(percpu_rw_is_write_locked(&lgt->lock));
-    /*
-     * Must have the remote domain's grant table write lock while
-     * counting its active entries.
-     */
-    ASSERT(percpu_rw_is_write_locked(&rd->grant_table->lock));
-
-    smp_rmb();
-
-    for ( handle = 0; !(kind & MAPKIND_WRITE) && handle < limit; handle++ )
-    {
-        map = &maptrack_entry(lgt, handle);
-        if ( !(map->flags & (GNTMAP_device_map|GNTMAP_host_map)) ||
-             map->domid != rd->domain_id )
-            continue;
-        if ( mfn_eq(_active_entry(rd->grant_table, map->ref).mfn, mfn) )
-            kind |= map->flags & GNTMAP_readonly ?
-                    MAPKIND_READ : MAPKIND_WRITE;
-    }
-
-    return kind;
-}
+union maptrack_node {
+    struct {
+        /* Radix tree slot pointers use two of the bits. */
+#ifdef __BIG_ENDIAN_BITFIELD
+        unsigned long _0 : 2;
+#endif
+        unsigned long rd : BITS_PER_LONG / 2 - 1;
+        unsigned long wr : BITS_PER_LONG / 2 - 1;
+#ifndef __BIG_ENDIAN_BITFIELD
+        unsigned long _0 : 2;
+#endif
+    } cnt;
+    unsigned long raw;
+};
 
 static void
 map_grant_ref(
@@ -954,7 +918,6 @@ map_grant_ref(
     struct grant_mapping *mt;
     grant_entry_header_t *shah;
     uint16_t *status;
-    bool_t need_iommu;
 
     led = current;
     ld = led->domain;
@@ -1167,31 +1130,82 @@ map_grant_ref(
         goto undo_out;
     }
 
-    need_iommu = gnttab_need_iommu_mapping(ld);
-    if ( need_iommu )
+    /*
+     * This is deliberately not checking the page's owner: get_paged_frame()
+     * explicitly rejects foreign pages, and all success paths above yield
+     * either owner == rd or owner == dom_io (the dom_cow case is irrelevant
+     * as mem-sharing and IOMMU use are incompatible). The dom_io case would
+     * need checking separately if we compared against owner here.
+     */
+    if ( ld != rd && gnttab_need_iommu_mapping(ld) )
     {
+        union maptrack_node node = {
+            .cnt.rd = !!(op->flags & GNTMAP_readonly),
+            .cnt.wr = !(op->flags & GNTMAP_readonly),
+        };
+        int err;
+        void **slot = NULL;
         unsigned int kind;
 
-        double_gt_lock(lgt, rgt);
+        grant_write_lock(lgt);
+
+        err = radix_tree_insert(&lgt->maptrack_tree, mfn_x(mfn),
+                                radix_tree_ulong_to_ptr(node.raw));
+        if ( err == -EEXIST )
+        {
+            slot = radix_tree_lookup_slot(&lgt->maptrack_tree, mfn_x(mfn));
+            if ( likely(slot) )
+            {
+                node.raw = radix_tree_ptr_to_ulong(*slot);
+                err = -EBUSY;
+
+                /* Update node only when refcount doesn't overflow. */
+                if ( op->flags & GNTMAP_readonly ? ++node.cnt.rd
+                                                 : ++node.cnt.wr )
+                {
+                    radix_tree_replace_slot(slot,
+                                            radix_tree_ulong_to_ptr(node.raw));
+                    err = 0;
+                }
+            }
+            else
+                ASSERT_UNREACHABLE();
+        }
 
         /*
          * We're not translated, so we know that dfns and mfns are
          * the same things, so the IOMMU entry is always 1-to-1.
          */
-        kind = mapkind(lgt, rd, mfn);
-        if ( !(op->flags & GNTMAP_readonly) &&
-             !(kind & MAPKIND_WRITE) )
+        if ( !(op->flags & GNTMAP_readonly) && node.cnt.wr == 1 )
             kind = IOMMUF_readable | IOMMUF_writable;
-        else if ( !kind )
+        else if ( (op->flags & GNTMAP_readonly) &&
+                  node.cnt.rd == 1 && !node.cnt.wr )
             kind = IOMMUF_readable;
         else
             kind = 0;
-        if ( kind && iommu_legacy_map(ld, _dfn(mfn_x(mfn)), mfn, 0, kind) )
+        if ( err ||
+             (kind && iommu_legacy_map(ld, _dfn(mfn_x(mfn)), mfn, 0, kind)) )
         {
-            double_gt_unlock(lgt, rgt);
+            if ( !err )
+            {
+                if ( slot )
+                {
+                    op->flags & GNTMAP_readonly ? node.cnt.rd--
+                                                : node.cnt.wr--;
+                    radix_tree_replace_slot(slot,
+                                            radix_tree_ulong_to_ptr(node.raw));
+                }
+                else
+                    radix_tree_delete(&lgt->maptrack_tree, mfn_x(mfn));
+            }
+
             rc = GNTST_general_error;
-            goto undo_out;
         }
+
+        grant_write_unlock(lgt);
+
+        if ( rc != GNTST_okay )
+            goto undo_out;
     }
 
     TRACE_1D(TRC_MEM_PAGE_GRANT_MAP, op->dom);
@@ -1199,19 +1213,12 @@ map_grant_ref(
     /*
      * All maptrack entry users check mt->flags first before using the
      * other fields so just ensure the flags field is stored last.
-     *
-     * However, if gnttab_need_iommu_mapping() then this would race
-     * with a concurrent mapkind() call (on an unmap, for example)
-     * and a lock is required.
      */
     mt = &maptrack_entry(lgt, handle);
     mt->domid = op->dom;
     mt->ref   = op->ref;
     smp_wmb();
     write_atomic(&mt->flags, op->flags);
-
-    if ( need_iommu )
-        double_gt_unlock(lgt, rgt);
 
     op->dev_bus_addr = mfn_to_maddr(mfn);
     op->handle       = handle;
@@ -1431,21 +1438,44 @@ unmap_common(
     if ( put_handle )
         put_maptrack_handle(lgt, op->handle);
 
-    if ( rc == GNTST_okay && gnttab_need_iommu_mapping(ld) )
+    /*
+     * map_grant_ref() will only increment the refcount (and update the
+     * IOMMU) once per mapping. So we only want to decrement it once the
+     * maptrack handle has been put, alongside the further IOMMU update.
+     *
+     * For the second and third check, see the respective comment in
+     * map_grant_ref().
+     */
+    if ( put_handle && ld != rd && gnttab_need_iommu_mapping(ld) )
     {
-        unsigned int kind;
+        void **slot;
+        union maptrack_node node;
         int err = 0;
 
-        double_gt_lock(lgt, rgt);
+        grant_write_lock(lgt);
+        slot = radix_tree_lookup_slot(&lgt->maptrack_tree, mfn_x(op->mfn));
+        node.raw = likely(slot) ? radix_tree_ptr_to_ulong(*slot) : 0;
 
-        kind = mapkind(lgt, rd, op->mfn);
-        if ( !kind )
+        /* Refcount must not underflow. */
+        if ( !(flags & GNTMAP_readonly ? node.cnt.rd--
+                                       : node.cnt.wr--) )
+            BUG();
+
+        if ( !node.raw )
             err = iommu_legacy_unmap(ld, _dfn(mfn_x(op->mfn)), 0);
-        else if ( !(kind & MAPKIND_WRITE) )
+        else if ( !(flags & GNTMAP_readonly) && !node.cnt.wr )
             err = iommu_legacy_map(ld, _dfn(mfn_x(op->mfn)), op->mfn, 0,
                                    IOMMUF_readable);
 
-        double_gt_unlock(lgt, rgt);
+        if ( err )
+            ;
+        else if ( !node.raw )
+            radix_tree_delete(&lgt->maptrack_tree, mfn_x(op->mfn));
+        else
+            radix_tree_replace_slot(slot,
+                                    radix_tree_ulong_to_ptr(node.raw));
+
+        grant_write_unlock(lgt);
 
         if ( err )
             rc = GNTST_general_error;
@@ -1903,6 +1933,8 @@ int grant_table_init(struct domain *d, int max_grant_frames,
         gt->maptrack = vzalloc(gt->max_maptrack_frames * sizeof(*gt->maptrack));
         if ( gt->maptrack == NULL )
             goto out;
+
+        radix_tree_init(&gt->maptrack_tree);
     }
 
     /* Shared grant table. */
@@ -2261,7 +2293,8 @@ gnttab_transfer(
          * pages when it is dying.
          */
         if ( unlikely(e->is_dying) ||
-             unlikely(e->tot_pages >= e->max_pages) )
+             unlikely(e->tot_pages >= e->max_pages) ||
+             unlikely(!(e->tot_pages + 1)) )
         {
             spin_unlock(&e->page_alloc_lock);
 
@@ -2270,8 +2303,8 @@ gnttab_transfer(
                          e->domain_id);
             else
                 gdprintk(XENLOG_INFO,
-                         "Transferee d%d has no headroom (tot %u, max %u)\n",
-                         e->domain_id, e->tot_pages, e->max_pages);
+                         "Transferee %pd has no headroom (tot %u, max %u)\n",
+                         e, e->tot_pages, e->max_pages);
 
             gop.status = GNTST_general_error;
             goto unlock_and_copyback;
@@ -2551,9 +2584,8 @@ acquire_grant_for_copy(
                      trans_domid);
 
         /*
-         * acquire_grant_for_copy() could take the lock on the
-         * remote table (if rd == td), so we have to drop the lock
-         * here and reacquire.
+         * acquire_grant_for_copy() will take the lock on the remote table,
+         * so we have to drop the lock here and reacquire.
          */
         active_entry_release(act);
         grant_read_unlock(rgt);
@@ -2590,11 +2622,25 @@ acquire_grant_for_copy(
                           act->trans_gref != trans_gref ||
                           !act->is_sub_page)) )
         {
-            release_grant_for_copy(td, trans_gref, readonly);
-            fixup_status_for_copy_pin(rd, act, status);
-            rcu_unlock_domain(td);
+            /*
+             * Like above for acquire_grant_for_copy() we need to drop and then
+             * re-acquire the locks here to prevent lock order inversion issues.
+             * Unlike for acquire_grant_for_copy() we don't need to re-check
+             * anything, as release_grant_for_copy() doesn't depend on the grant
+             * table entry: It only updates internal state and the status flags.
+             */
             active_entry_release(act);
             grant_read_unlock(rgt);
+
+            release_grant_for_copy(td, trans_gref, readonly);
+            rcu_unlock_domain(td);
+
+            grant_read_lock(rgt);
+            act = active_entry_acquire(rgt, gref);
+            fixup_status_for_copy_pin(rd, act, status);
+            active_entry_release(act);
+            grant_read_unlock(rgt);
+
             put_page(*page);
             *page = NULL;
             return ERESTART;
@@ -3228,12 +3274,11 @@ gnttab_get_status_frames(XEN_GUEST_HANDLE_PARAM(gnttab_get_status_frames_t) uop,
         goto unlock;
     }
 
-    if ( unlikely(limit_max < grant_to_status_frames(op.nr_frames)) )
+    if ( unlikely(limit_max < op.nr_frames) )
     {
         gdprintk(XENLOG_WARNING,
-                 "grant_to_status_frames(%u) for d%d is too large (%u,%u)\n",
-                 op.nr_frames, d->domain_id,
-                 grant_to_status_frames(op.nr_frames), limit_max);
+                 "nr_status_frames for %pd is too large (%u,%u)\n",
+                 d, op.nr_frames, limit_max);
         op.status = GNTST_general_error;
         goto unlock;
     }
@@ -3375,7 +3420,7 @@ gnttab_swap_grant_ref(XEN_GUEST_HANDLE_PARAM(gnttab_swap_grant_ref_t) uop,
     return 0;
 }
 
-static int cache_flush(const gnttab_cache_flush_t *cflush, grant_ref_t *cur_ref)
+static int _cache_flush(const gnttab_cache_flush_t *cflush, grant_ref_t *cur_ref)
 {
     struct domain *d, *owner;
     struct page_info *page;
@@ -3469,7 +3514,7 @@ gnttab_cache_flush(XEN_GUEST_HANDLE_PARAM(gnttab_cache_flush_t) uop,
             return -EFAULT;
         for ( ; ; )
         {
-            int ret = cache_flush(&op, cur_ref);
+            int ret = _cache_flush(&op, cur_ref);
 
             if ( ret < 0 )
                 return ret;
@@ -3666,9 +3711,7 @@ do_grant_table_op(
 #include "compat/grant_table.c"
 #endif
 
-void
-gnttab_release_mappings(
-    struct domain *d)
+int gnttab_release_mappings(struct domain *d)
 {
     struct grant_table   *gt = d->grant_table, *rgt;
     struct grant_mapping *map;
@@ -3682,9 +3725,34 @@ gnttab_release_mappings(
 
     BUG_ON(!d->is_dying);
 
-    for ( handle = 0; handle < gt->maptrack_limit; handle++ )
+    if ( !gt || !gt->maptrack )
+        return 0;
+
+    for ( handle = gt->maptrack_limit; handle; )
     {
         unsigned int clear_flags = 0;
+        mfn_t mfn;
+
+        /*
+         * Deal with full pages such that their freeing (in the body of the
+         * if()) remains simple.
+         */
+        if ( handle < gt->maptrack_limit && !(handle % MAPTRACK_PER_PAGE) )
+        {
+            /*
+             * Changing maptrack_limit alters nr_maptrack_frames()'es return
+             * value. Free the then excess trailing page right here, rather
+             * than leaving it to grant_table_destroy() (and in turn requiring
+             * to leave gt->maptrack_limit unaltered).
+             */
+            gt->maptrack_limit = handle;
+            FREE_XENHEAP_PAGE(gt->maptrack[nr_maptrack_frames(gt)]);
+
+            if ( hypercall_preempt_check() )
+                return -ERESTART;
+        }
+
+        --handle;
 
         map = &maptrack_entry(gt, handle);
         if ( !(map->flags & (GNTMAP_device_map|GNTMAP_host_map)) )
@@ -3769,13 +3837,32 @@ gnttab_release_mappings(
         if ( clear_flags )
             gnttab_clear_flags(rd, clear_flags, status);
 
+        mfn = act->mfn;
+
         active_entry_release(act);
         grant_read_unlock(rgt);
 
         rcu_unlock_domain(rd);
 
         map->flags = 0;
+
+        /*
+         * This is excessive in that a single such call would suffice per
+         * mapped MFN (or none at all, if no entry was ever inserted). But it
+         * should be the common case for an MFN to be mapped just once, and
+         * this way we don't need to further maintain the counters. We also
+         * don't want to leave cleaning up of the tree as a whole to the end
+         * of the function, as this could take quite some time.
+         */
+        radix_tree_delete(&gt->maptrack_tree, mfn_x(mfn));
     }
+
+    gt->maptrack_limit = 0;
+    FREE_XENHEAP_PAGE(gt->maptrack[0]);
+
+    radix_tree_destroy(&gt->maptrack_tree, NULL);
+
+    return 0;
 }
 
 void grant_table_warn_active_grants(struct domain *d)
@@ -3839,8 +3926,7 @@ grant_table_destroy(
         free_xenheap_page(t->shared_raw[i]);
     xfree(t->shared_raw);
 
-    for ( i = 0; i < nr_maptrack_frames(t); i++ )
-        free_xenheap_page(t->maptrack[i]);
+    ASSERT(!t->maptrack_limit);
     vfree(t->maptrack);
 
     for ( i = 0; i < nr_active_grant_frames(t); i++ )
@@ -4007,7 +4093,16 @@ int gnttab_map_frame(struct domain *d, unsigned long idx, gfn_t gfn, mfn_t *mfn)
     }
 
     if ( !rc )
-        gnttab_set_frame_gfn(gt, status, idx, gfn);
+    {
+        /*
+         * Make sure gnttab_unpopulate_status_frames() won't (successfully)
+         * free the page until our caller has completed its operation.
+         */
+        if ( get_page(mfn_to_page(*mfn), d) )
+            gnttab_set_frame_gfn(gt, status, idx, gfn);
+        else
+            rc = -EBUSY;
+    }
 
     grant_write_unlock(gt);
 

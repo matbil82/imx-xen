@@ -216,7 +216,8 @@ static void ctxt_switch_to(struct vcpu *n)
     WRITE_SYSREG64(n->arch.ttbr1, TTBR1_EL1);
 
     /*
-     * Erratum #852523: DACR32_EL2 must be restored before one of the
+     * Erratum #852523 (Cortex-A57) or erratum #853709 (Cortex-A72):
+     * DACR32_EL2 must be restored before one of the
      * following sysregs: SCTLR_EL1, TCR_EL1, TTBR0_EL1, TTBR1_EL1 or
      * CONTEXTIDR_EL1.
      */
@@ -245,7 +246,8 @@ static void ctxt_switch_to(struct vcpu *n)
 
     /*
      * This write to sysreg CONTEXTIDR_EL1 ensures we don't hit erratum
-     * #852523. I.e DACR32_EL2 is not correctly synchronized.
+     * #852523 (Cortex-A57) or #853709 (Cortex-A72).
+     * I.e DACR32_EL2 is not correctly synchronized.
      */
     WRITE_SYSREG(n->arch.contextidr, CONTEXTIDR_EL1);
     WRITE_SYSREG(n->arch.tpidr_el0, TPIDR_EL0);
@@ -327,7 +329,7 @@ static void schedule_tail(struct vcpu *prev)
 
 static void continue_new_vcpu(struct vcpu *prev)
 {
-    current->arch.actlr = READ_SYSREG32(ACTLR_EL1);
+    current->arch.actlr = READ_SYSREG(ACTLR_EL1);
     processor_vcpu_initialise(current);
 
     schedule_tail(prev);
@@ -371,7 +373,20 @@ void sync_local_execstate(void)
 
 void sync_vcpu_execstate(struct vcpu *v)
 {
-    /* Nothing to do -- no lazy switching */
+    /*
+     * We don't support lazy switching.
+     *
+     * However the context may have been saved from a remote pCPU so we
+     * need a barrier to ensure it is observed before continuing.
+     *
+     * Per vcpu_context_saved(), the context can be observed when
+     * v->is_running is false (the caller should check it before calling
+     * this function).
+     *
+     * Note this is a full barrier to also prevent update of the context
+     * to happen before it was observed.
+     */
+    smp_mb();
 }
 
 #define NEXT_ARG(fmt, args)                                                 \
@@ -764,10 +779,10 @@ void arch_domain_destroy(struct domain *d)
 {
     platform_domain_destroy(d);
     /* IOMMU page table is shared with P2M, always call
-     * iommu_domain_destroy() before p2m_teardown().
+     * iommu_domain_destroy() before p2m_final_teardown().
      */
     iommu_domain_destroy(d);
-    p2m_teardown(d);
+    p2m_final_teardown(d);
     domain_vgic_free(d);
     domain_vuart_free(d);
     free_xenheap_page(d->shared_info);
@@ -1007,6 +1022,22 @@ int domain_relinquish_resources(struct domain *d)
     case RELMEM_mapping:
         ret = relinquish_p2m_mapping(d);
         if ( ret )
+            return ret;
+
+        d->arch.relmem = RELMEM_p2m;
+        /* Fallthrough */
+
+    case RELMEM_p2m:
+        ret = p2m_teardown(d, true);
+        if ( ret )
+            return ret;
+
+        d->arch.relmem = RELMEM_p2m_pool;
+        /* Fallthrough */
+
+    case RELMEM_p2m_pool:
+        ret = p2m_teardown_allocation(d);
+        if( ret )
             return ret;
 
         d->arch.relmem = RELMEM_done;

@@ -334,7 +334,7 @@ uint64_t get_cpu_idle_time(unsigned int cpu)
     struct vcpu_runstate_info state = { 0 };
     struct vcpu *v = idle_vcpu[cpu];
 
-    if ( cpu_online(cpu) && v )
+    if ( cpu_online(cpu) && get_sched_res(cpu) )
         vcpu_runstate_get(v, &state);
 
     return state.time[RUNSTATE_running];
@@ -1366,6 +1366,8 @@ void vcpu_block(void)
 
     set_bit(_VPF_blocked, &v->pause_flags);
 
+    smp_mb__after_atomic();
+
     arch_vcpu_block(v);
 
     /* Check for events /after/ blocking: avoids wakeup waiting race. */
@@ -1434,7 +1436,7 @@ static long do_poll(struct sched_poll *sched_poll)
             goto out;
 
         rc = -EINVAL;
-        if ( port >= d->max_evtchns )
+        if ( !port_is_valid(d, port) )
             goto out;
 
         rc = 0;
@@ -2270,13 +2272,20 @@ static struct sched_unit *sched_wait_rendezvous_in(struct sched_unit *prev,
             v = unit2vcpu_cpu(prev, cpu);
         }
         /*
-         * Coming from idle might need to do tasklet work.
+         * Check for any work to be done which might need cpu synchronization.
+         * This is either pending RCU work, or tasklet work when coming from
+         * idle. It is mandatory that RCU softirqs are of higher priority
+         * than scheduling ones as otherwise a deadlock might occur.
          * In order to avoid deadlocks we can't do that here, but have to
-         * continue the idle loop.
+         * schedule the previous vcpu again, which will lead to the desired
+         * processing to be done.
          * Undo the rendezvous_in_cnt decrement and schedule another call of
          * sched_slave().
          */
-        if ( is_idle_unit(prev) && sched_tasklet_check_cpu(cpu) )
+        BUILD_BUG_ON(RCU_SOFTIRQ > SCHED_SLAVE_SOFTIRQ ||
+                     RCU_SOFTIRQ > SCHEDULE_SOFTIRQ);
+        if ( rcu_pending(cpu) ||
+             (is_idle_unit(prev) && sched_tasklet_check_cpu(cpu)) )
         {
             struct vcpu *vprev = current;
 

@@ -24,7 +24,6 @@
 #include <asm/msr.h>
 #include <asm/processor.h>
 #include <asm/microcode.h>
-#include <asm/hvm/svm/svm.h>
 
 #define pr_debug(x...) ((void)0)
 
@@ -106,6 +105,7 @@ static bool_t verify_patch_size(uint32_t patch_size)
 #define F15H_MPB_MAX_SIZE 4096
 #define F16H_MPB_MAX_SIZE 3458
 #define F17H_MPB_MAX_SIZE 3200
+#define F19H_MPB_MAX_SIZE 5568
 
     switch (boot_cpu_data.x86)
     {
@@ -120,6 +120,9 @@ static bool_t verify_patch_size(uint32_t patch_size)
         break;
     case 0x17:
         max_size = F17H_MPB_MAX_SIZE;
+        break;
+    case 0x19:
+        max_size = F19H_MPB_MAX_SIZE;
         break;
     default:
         max_size = F1XH_MPB_MAX_SIZE;
@@ -293,7 +296,8 @@ static int get_ucode_from_buffer_amd(
         return -EINVAL;
     }
 
-    if ( (*offset + mpbuf->len) > bufsize )
+    if ( (*offset + mpbuf->len) > bufsize ||
+         mpbuf->len < sizeof(struct microcode_header_amd) )
     {
         printk(KERN_ERR "microcode: Bad data in microcode data file\n");
         return -EINVAL;
@@ -590,27 +594,10 @@ static struct microcode_patch *cpu_request_microcode(const void *buf,
     return patch;
 }
 
-#ifdef CONFIG_HVM
-static int start_update(void)
-{
-    /*
-     * svm_host_osvw_init() will be called on each cpu by calling '.end_update'
-     * in common code.
-     */
-    svm_host_osvw_reset();
-
-    return 0;
-}
-#endif
-
 static const struct microcode_ops microcode_amd_ops = {
     .cpu_request_microcode            = cpu_request_microcode,
     .collect_cpu_info                 = collect_cpu_info,
     .apply_microcode                  = apply_microcode,
-#ifdef CONFIG_HVM
-    .start_update                     = start_update,
-    .end_update_percpu                = svm_host_osvw_init,
-#endif
     .free_patch                       = free_patch,
     .compare_patch                    = compare_patch,
     .match_cpu                        = match_cpu,

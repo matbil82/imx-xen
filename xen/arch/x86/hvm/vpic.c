@@ -261,8 +261,7 @@ static void vpic_ioport_write(
                 vpic_update_int_output(vpic);
                 vpic_unlock(vpic);
                 hvm_dpci_eoi(current->domain,
-                             hvm_isa_irq_to_gsi((addr >> 7) ? (irq|8) : irq),
-                             NULL);
+                             hvm_isa_irq_to_gsi((addr >> 7) ? (irq | 8) : irq));
                 return; /* bail immediately */
             case 6: /* Set Priority                */
                 vpic->priority_add = (val + 1) & 7;
@@ -402,7 +401,7 @@ static int vpic_load(struct domain *d, hvm_domain_context_t *h)
 
     /* Which PIC is this? */
     if ( inst > 1 )
-        return -EINVAL;
+        return -ENOENT;
     s = &d->arch.hvm.vpic[inst];
 
     /* Load the state */

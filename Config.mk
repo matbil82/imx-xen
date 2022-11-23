@@ -130,6 +130,18 @@ define cc-ver-check-closure
     endif
 endef
 
+# $(if-success,<command>,<then>,<else>)
+# Return <then> if <command> exits with 0, <else> otherwise.
+if-success = $(shell { $(1); } >/dev/null 2>&1 && echo "$(2)" || echo "$(3)")
+
+# $(success,<command>)
+# Return y if <command> exits with 0, n otherwise
+success = $(call if-success,$(1),y,n)
+
+# $(ld-option,<flag>)
+# Return y if the linker supports <flag>, n otherwise
+ld-option = $(call success,$(LD) -v $(1))
+
 # cc-ifversion: Check compiler version and take branch accordingly
 # Usage $(call cc-ifversion,lt,0x040700,string_if_y,string_if_n)
 cc-ifversion = $(shell [ $(call cc-ver,$(CC),$(1),$(2)) = "y" ] \
@@ -235,7 +247,8 @@ APPEND_LDFLAGS += $(foreach i, $(APPEND_LIB), -L$(i))
 APPEND_CFLAGS += $(foreach i, $(APPEND_INCLUDES), -I$(i))
 
 EMBEDDED_EXTRA_CFLAGS := -nopie -fno-stack-protector -fno-stack-protector-all
-EMBEDDED_EXTRA_CFLAGS += -fno-exceptions
+EMBEDDED_EXTRA_CFLAGS += -fno-exceptions -fno-asynchronous-unwind-tables
+EMBEDDED_EXTRA_CFLAGS += -fcf-protection=none
 
 XEN_EXTFILES_URL ?= http://xenbits.xen.org/xen-extfiles
 # All the files at that location were downloaded from elsewhere on
@@ -275,15 +288,15 @@ SEABIOS_UPSTREAM_URL ?= git://xenbits.xen.org/seabios.git
 MINIOS_UPSTREAM_URL ?= git://xenbits.xen.org/mini-os.git
 endif
 OVMF_UPSTREAM_REVISION ?= 20d2e5a125e34fc8501026613a71549b2a1a3e54
-QEMU_UPSTREAM_REVISION ?= qemu-xen-4.13.1
-MINIOS_UPSTREAM_REVISION ?= xen-RELEASE-4.13.1
+QEMU_UPSTREAM_REVISION ?= qemu-xen-4.13.4
+MINIOS_UPSTREAM_REVISION ?= xen-RELEASE-4.13.4
 
 SEABIOS_UPSTREAM_REVISION ?= rel-1.12.1
 
 ETHERBOOT_NICS ?= rtl8139 8086100e
 
 
-QEMU_TRADITIONAL_REVISION ?= xen-4.13.1
+QEMU_TRADITIONAL_REVISION ?= xen-4.13.4
 # Wed Oct 10 18:52:54 2018 +0000
 # xen/pt: allow QEMU to request MSI unmasking at bind time
 

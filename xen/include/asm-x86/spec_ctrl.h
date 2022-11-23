@@ -20,10 +20,41 @@
 #ifndef __X86_SPEC_CTRL_H__
 #define __X86_SPEC_CTRL_H__
 
-/* Encoding of cpuinfo.spec_ctrl_flags */
+/*
+ * Encoding of:
+ *   cpuinfo.spec_ctrl_flags
+ *   default_spec_ctrl_flags
+ *   domain.spec_ctrl_flags
+ *
+ * Live settings are in the top-of-stack block, because they need to be
+ * accessable when XPTI is active.  Some settings are fixed from boot, some
+ * context switched per domain, and some inhibited in the S3 path.
+ */
 #define SCF_use_shadow (1 << 0)
-#define SCF_ist_wrmsr  (1 << 1)
+#define SCF_ist_sc_msr (1 << 1)
 #define SCF_ist_rsb    (1 << 2)
+#define SCF_verw       (1 << 3)
+#define SCF_ist_ibpb   (1 << 4)
+#define SCF_entry_ibpb (1 << 5)
+
+/*
+ * The IST paths (NMI/#MC) can interrupt any arbitrary context.  Some
+ * functionality requires updated microcode to work.
+ *
+ * On boot, this is easy; we load microcode before figuring out which
+ * speculative protections to apply.  However, on the S3 resume path, we must
+ * be able to disable the configured mitigations until microcode is reloaded.
+ *
+ * These are the controls to inhibit on the S3 resume path until microcode has
+ * been reloaded.
+ */
+#define SCF_IST_MASK (SCF_ist_sc_msr | SCF_ist_ibpb)
+
+/*
+ * Some speculative protections are per-domain.  These settings are merged
+ * into the top-of-stack block in the context switch path.
+ */
+#define SCF_DOM_MASK (SCF_verw | SCF_entry_ibpb)
 
 #ifndef __ASSEMBLY__
 
@@ -32,8 +63,31 @@
 #include <asm/msr-index.h>
 
 void init_speculation_mitigations(void);
+void spec_ctrl_init_domain(struct domain *d);
 
-extern bool opt_ibpb;
+/*
+ * Switch to a new guest prediction context.
+ *
+ * This flushes all indirect branch predictors (BTB, RSB/RAS), so guest code
+ * which has previously run on this CPU can't attack subsequent guest code.
+ *
+ * As this flushes the RSB/RAS, it destroys the predictions of the calling
+ * context.  For best performace, arrange for this to be used when we're going
+ * to jump out of the current context, e.g. with reset_stack_and_jump().
+ *
+ * For hardware which mis-implements IBPB, fix up by flushing the RSB/RAS
+ * manually.
+ */
+static always_inline void spec_ctrl_new_guest_context(void)
+{
+    wrmsrl(MSR_PRED_CMD, PRED_CMD_IBPB);
+
+    /* (ab)use alternative_input() to specify clobbers. */
+    alternative_input("", "DO_OVERWRITE_RSB", X86_BUG_IBPB_NO_RET,
+                      : "rax", "rcx");
+}
+
+extern int8_t opt_ibpb_ctxt_switch;
 extern bool opt_ssbd;
 extern int8_t opt_eager_fpu;
 extern int8_t opt_l1d_flush;
@@ -78,7 +132,8 @@ static always_inline void spec_ctrl_enter_idle(struct cpu_info *info)
     uint32_t val = 0;
 
     /*
-     * Branch Target Injection:
+     * It is recommended in some cases to clear MSR_SPEC_CTRL when going idle,
+     * to avoid impacting sibling threads.
      *
      * Latch the new shadow value, then enable shadowing, then update the MSR.
      * There are no SMP issues here; only local processor ordering concerns.
@@ -114,7 +169,7 @@ static always_inline void spec_ctrl_exit_idle(struct cpu_info *info)
     uint32_t val = info->xen_spec_ctrl;
 
     /*
-     * Branch Target Injection:
+     * Restore MSR_SPEC_CTRL on exit from idle.
      *
      * Disable shadowing before updating the MSR.  There are no SMP issues
      * here; only local processor ordering concerns.

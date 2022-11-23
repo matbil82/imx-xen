@@ -45,6 +45,9 @@ static inline void svm_invlpga(unsigned long linear, uint32_t asid)
         "a" (linear), "c" (asid));
 }
 
+struct cpu_user_regs;
+struct vcpu;
+
 unsigned long *svm_msrbit(unsigned long *msr_bitmap, uint32_t msr);
 void __update_guest_eip(struct cpu_user_regs *regs, unsigned int inst_len);
 void svm_update_guest_cr(struct vcpu *, unsigned int cr, unsigned int flags);
@@ -52,10 +55,12 @@ void svm_update_guest_cr(struct vcpu *, unsigned int cr, unsigned int flags);
 /*
  * PV context switch helper. Calls with zero ldt_base request a prefetch of
  * the VMCB area to be loaded from, instead of an actual load of state.
+ *
+ * Must only be used for NUL FS/GS, as the segment attributes/limits are not
+ * read from the GDT/LDT.
  */
 bool svm_load_segs(unsigned int ldt_ents, unsigned long ldt_base,
-                   unsigned int fs_sel, unsigned long fs_base,
-                   unsigned int gs_sel, unsigned long gs_base,
+                   unsigned long fs_base, unsigned long gs_base,
                    unsigned long gs_shadow);
 
 extern u32 svm_feature_flags;
@@ -72,6 +77,7 @@ extern u32 svm_feature_flags;
 #define SVM_FEATURE_PAUSETHRESH   12 /* Pause intercept filter support */
 #define SVM_FEATURE_VLOADSAVE     15 /* virtual vmload/vmsave */
 #define SVM_FEATURE_VGIF          16 /* Virtual GIF */
+#define SVM_FEATURE_SPEC_CTRL     20 /* MSR_SPEC_CTRL virtualisation */
 
 #define cpu_has_svm_feature(f) (svm_feature_flags & (1u << (f)))
 #define cpu_has_svm_npt       cpu_has_svm_feature(SVM_FEATURE_NPT)
@@ -85,6 +91,7 @@ extern u32 svm_feature_flags;
 #define cpu_has_pause_thresh  cpu_has_svm_feature(SVM_FEATURE_PAUSETHRESH)
 #define cpu_has_tsc_ratio     cpu_has_svm_feature(SVM_FEATURE_TSCRATEMSR)
 #define cpu_has_svm_vloadsave cpu_has_svm_feature(SVM_FEATURE_VLOADSAVE)
+#define cpu_has_svm_spec_ctrl cpu_has_svm_feature(SVM_FEATURE_SPEC_CTRL)
 
 #define SVM_PAUSEFILTER_INIT    4000
 #define SVM_PAUSETHRESH_INIT    1000
@@ -92,9 +99,6 @@ extern u32 svm_feature_flags;
 /* TSC rate */
 #define DEFAULT_TSC_RATIO       0x0000000100000000ULL
 #define TSC_RATIO_RSVD_BITS     0xffffff0000000000ULL
-
-extern void svm_host_osvw_reset(void);
-extern void svm_host_osvw_init(void);
 
 /* EXITINFO1 fields on NPT faults */
 #define _NPT_PFEC_with_gla     32

@@ -43,6 +43,14 @@ struct vtimer {
         uint64_t cval;
 };
 
+struct paging_domain {
+    spinlock_t lock;
+    /* Free P2M pages from the pre-allocated P2M pool */
+    struct page_list_head p2m_freelist;
+    /* Number of pages from the pre-allocated P2M pool */
+    unsigned long p2m_total_pages;
+};
+
 struct arch_domain
 {
 #ifdef CONFIG_ARM_64
@@ -54,6 +62,8 @@ struct arch_domain
 
     struct hvm_domain hvm;
 
+    struct paging_domain paging;
+
     struct vmmio vmmio;
 
     /* Continuable domain_relinquish_resources(). */
@@ -63,6 +73,8 @@ struct arch_domain
         RELMEM_xen,
         RELMEM_page,
         RELMEM_mapping,
+        RELMEM_p2m,
+        RELMEM_p2m_pool,
         RELMEM_done,
     } relmem;
 
@@ -167,7 +179,7 @@ struct arch_vcpu
 
     /* Control Registers */
     register_t sctlr;
-    uint32_t actlr;
+    register_t actlr;
     uint32_t cpacr;
 
     uint32_t contextidr;

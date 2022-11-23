@@ -17,7 +17,7 @@ ENTRY(entry_int82)
         movl  $HYPERCALL_VECTOR, 4(%rsp)
         SAVE_ALL compat=1 /* DPL1 gate, restricted to 32bit PV guests only. */
 
-        SPEC_CTRL_ENTRY_FROM_PV /* Req: %rsp=regs/cpuinfo, Clob: acd */
+        SPEC_CTRL_ENTRY_FROM_PV /* Req: %rsp=regs/cpuinfo, %rdx=0, Clob: acd */
         /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
 
         CR4_PV32_RESTORE
@@ -78,7 +78,6 @@ compat_process_softirqs:
         sti
 .Lcompat_bounce_exception:
         call  compat_create_bounce_frame
-        movb  $0, TRAPBOUNCE_flags(%rdx)
         jmp   compat_test_all_events
 
 	ALIGN
@@ -120,7 +119,7 @@ compat_process_trap:
 /* %rbx: struct vcpu, interrupts disabled */
 ENTRY(compat_restore_all_guest)
         ASSERT_INTERRUPTS_DISABLED
-        mov   $~(X86_EFLAGS_IOPL|X86_EFLAGS_NT|X86_EFLAGS_VM),%r11d
+        mov   $~(X86_EFLAGS_IOPL | X86_EFLAGS_VM), %r11d
         and   UREGS_eflags(%rsp),%r11d
 
 .macro alt_cr4_pv32
@@ -209,7 +208,7 @@ ENTRY(cstar_enter)
         movl  $TRAP_syscall, 4(%rsp)
         SAVE_ALL
 
-        SPEC_CTRL_ENTRY_FROM_PV /* Req: %rsp=regs/cpuinfo, Clob: acd */
+        SPEC_CTRL_ENTRY_FROM_PV /* Req: %rsp=regs/cpuinfo, %rdx=0, Clob: acd */
         /* WARNING! `ret`, `call *`, `jmp *` not safe before this point. */
 
         GET_STACK_END(bx)
@@ -349,7 +348,13 @@ __UNLIKELY_END(compat_bounce_null_selector)
         movl  %eax,UREGS_cs+8(%rsp)
         movl  TRAPBOUNCE_eip(%rdx),%eax
         movl  %eax,UREGS_rip+8(%rsp)
+
+        /* Trapbounce complete.  Clobber state to avoid an erroneous second injection. */
+        xor   %eax, %eax
+        mov   %ax,  TRAPBOUNCE_cs(%rdx)
+        mov   %al,  TRAPBOUNCE_flags(%rdx)
         ret
+
 .section .fixup,"ax"
 .Lfx13:
         xorl  %edi,%edi

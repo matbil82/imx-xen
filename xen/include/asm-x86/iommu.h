@@ -16,6 +16,7 @@
 
 #include <xen/errno.h>
 #include <xen/list.h>
+#include <xen/mem_access.h>
 #include <xen/spinlock.h>
 #include <asm/apicdef.h>
 #include <asm/processor.h>
@@ -49,7 +50,7 @@ struct arch_iommu
     spinlock_t mapping_lock;            /* io page table lock */
     int agaw;     /* adjusted guest address width, 0 is level 2 30-bit */
     u64 iommu_bitmap;              /* bitmap of iommu(s) that the domain uses */
-    struct list_head mapped_rmrrs;
+    struct list_head identity_maps;
 
     /* amd iommu support */
     int paging_mode;
@@ -97,10 +98,6 @@ static inline int iommu_adjust_irq_affinities(void)
            : 0;
 }
 
-/* While VT-d specific, this must get declared in a generic header. */
-int __must_check iommu_pte_flush(struct domain *d, u64 gfn, u64 *pte,
-                                 int order, int present);
-
 static inline bool iommu_supports_x2apic(void)
 {
     return iommu_init_ops && iommu_init_ops->supports_x2apic
@@ -116,10 +113,26 @@ static inline void iommu_disable_x2apic(void)
         iommu_ops.disable_x2apic();
 }
 
+int iommu_identity_mapping(struct domain *d, p2m_access_t p2ma,
+                           paddr_t base, paddr_t end,
+                           unsigned int flag);
+void iommu_identity_map_teardown(struct domain *d);
+
 extern bool untrusted_msi;
 
 int pi_update_irte(const struct pi_desc *pi_desc, const struct pirq *pirq,
                    const uint8_t gvec);
+
+#define iommu_sync_cache(addr, size) ({                 \
+    const struct iommu_ops *ops = iommu_get_ops();      \
+                                                        \
+    if ( ops->sync_cache )                              \
+        iommu_vcall(ops, sync_cache, addr, size);       \
+})
+
+unsigned long *iommu_init_domid(void);
+domid_t iommu_alloc_domid(unsigned long *map);
+void iommu_free_domid(domid_t domid, unsigned long *map);
 
 #endif /* !__ARCH_X86_IOMMU_H__ */
 /*

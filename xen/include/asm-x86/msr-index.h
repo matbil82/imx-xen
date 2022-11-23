@@ -41,6 +41,7 @@
 #define SPEC_CTRL_IBRS			(_AC(1, ULL) << 0)
 #define SPEC_CTRL_STIBP			(_AC(1, ULL) << 1)
 #define SPEC_CTRL_SSBD			(_AC(1, ULL) << 2)
+#define SPEC_CTRL_PSFD			(_AC(1, ULL) << 7)
 
 #define MSR_PRED_CMD			0x00000049
 #define PRED_CMD_IBPB			(_AC(1, ULL) << 0)
@@ -55,6 +56,11 @@
 #define ARCH_CAPS_IF_PSCHANGE_MC_NO	(_AC(1, ULL) << 6)
 #define ARCH_CAPS_TSX_CTRL		(_AC(1, ULL) << 7)
 #define ARCH_CAPS_TAA_NO		(_AC(1, ULL) << 8)
+#define ARCH_CAPS_SBDR_SSDP_NO		(_AC(1, ULL) << 13)
+#define ARCH_CAPS_FBSDP_NO		(_AC(1, ULL) << 14)
+#define ARCH_CAPS_PSDP_NO		(_AC(1, ULL) << 15)
+#define ARCH_CAPS_FB_CLEAR		(_AC(1, ULL) << 17)
+#define ARCH_CAPS_FB_CLEAR_CTRL		(_AC(1, ULL) << 18)
 
 #define MSR_FLUSH_CMD			0x0000010b
 #define FLUSH_CMD_L1D			(_AC(1, ULL) << 0)
@@ -95,6 +101,38 @@
 #define MSR_IA32_PERF_CAPABILITIES	0x00000345
 /* Lower 6 bits define the format of the address in the LBR stack */
 #define MSR_IA32_PERF_CAP_LBR_FORMAT	0x3f
+
+/*
+ * Intel Runtime Average Power Limiting (RAPL) interface.  Power plane base
+ * addresses (MSR_*_POWER_LIMIT) are model specific, but have so-far been
+ * consistent since their introduction in SandyBridge.
+ *
+ * Offsets of functionality from the power plane base is architectural, but
+ * not all power planes support all functionality.
+ */
+#define MSR_RAPL_POWER_UNIT		0x00000606
+
+#define MSR_PKG_POWER_LIMIT		0x00000610
+#define MSR_PKG_ENERGY_STATUS		0x00000611
+#define MSR_PKG_PERF_STATUS		0x00000613
+#define MSR_PKG_POWER_INFO		0x00000614
+
+#define MSR_DRAM_POWER_LIMIT		0x00000618
+#define MSR_DRAM_ENERGY_STATUS		0x00000619
+#define MSR_DRAM_PERF_STATUS		0x0000061b
+#define MSR_DRAM_POWER_INFO		0x0000061c
+
+#define MSR_PP0_POWER_LIMIT		0x00000638
+#define MSR_PP0_ENERGY_STATUS		0x00000639
+#define MSR_PP0_POLICY			0x0000063a
+
+#define MSR_PP1_POWER_LIMIT		0x00000640
+#define MSR_PP1_ENERGY_STATUS		0x00000641
+#define MSR_PP1_POLICY			0x00000642
+
+/* Intel Platform-wide power interface. */
+#define MSR_PLATFORM_ENERGY_COUNTER	0x0000064d
+#define MSR_PLATFORM_POWER_LIMIT	0x0000065c
 
 #define MSR_IA32_BNDCFGS		0x00000d90
 #define IA32_BNDCFGS_ENABLE		0x00000001
@@ -182,6 +220,14 @@
 #define MSR_MCU_OPT_CTRL                    0x00000123
 #define  MCU_OPT_CTRL_RNGDS_MITG_DIS        (_AC(1, ULL) <<  0)
 
+#define MSR_RTIT_OUTPUT_BASE                0x00000560
+#define MSR_RTIT_OUTPUT_MASK                0x00000561
+#define MSR_RTIT_CTL                        0x00000570
+#define MSR_RTIT_STATUS                     0x00000571
+#define MSR_RTIT_CR3_MATCH                  0x00000572
+#define MSR_RTIT_ADDR_A(n)                 (0x00000580 + (n) * 2)
+#define MSR_RTIT_ADDR_B(n)                 (0x00000581 + (n) * 2)
+
 #define MSR_U_CET                           0x000006a0
 #define MSR_S_CET                           0x000006a2
 #define MSR_PL0_SSP                         0x000006a4
@@ -227,7 +273,10 @@
 #define MSR_K8_ENABLE_C1E		0xc0010055
 #define MSR_K8_VM_CR			0xc0010114
 #define MSR_K8_VM_HSAVE_PA		0xc0010117
+#define MSR_VIRT_SPEC_CTRL		0xc001011f /* Layout matches MSR_SPEC_CTRL */
 
+#define MSR_F15H_CU_POWER		0xc001007a
+#define MSR_F15H_CU_MAX_POWER		0xc001007b
 #define MSR_AMD_FAM15H_EVNTSEL0		0xc0010200
 #define MSR_AMD_FAM15H_PERFCTR0		0xc0010201
 #define MSR_AMD_FAM15H_EVNTSEL1		0xc0010202
@@ -240,6 +289,10 @@
 #define MSR_AMD_FAM15H_PERFCTR4		0xc0010209
 #define MSR_AMD_FAM15H_EVNTSEL5		0xc001020a
 #define MSR_AMD_FAM15H_PERFCTR5		0xc001020b
+
+#define MSR_AMD_RAPL_POWER_UNIT		0xc0010299
+#define MSR_AMD_CORE_ENERGY_STATUS	0xc001029a
+#define MSR_AMD_PKG_ENERGY_STATUS	0xc001029b
 
 #define MSR_AMD_L7S0_FEATURE_MASK	0xc0011002
 #define MSR_AMD_THRM_FEATURE_MASK	0xc0011003
@@ -258,6 +311,7 @@
 #define MSR_AMD64_DC_CFG		0xc0011022
 #define MSR_AMD64_DE_CFG		0xc0011029
 #define AMD64_DE_CFG_LFENCE_SERIALISE	(_AC(1, ULL) << 1)
+#define MSR_AMD64_DE_CFG2		0xc00110e3
 
 #define MSR_AMD64_DR0_ADDRESS_MASK	0xc0011027
 #define MSR_AMD64_DR1_ADDRESS_MASK	0xc0011019
