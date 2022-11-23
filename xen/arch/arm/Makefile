@@ -103,6 +103,14 @@ prelink.o: $(ALL_OBJS)
 	$(LD) $(LDFLAGS) -r -o $@ $^
 endif
 
+ifeq ($(CONFIG_ARM64_ERRATUM_843419),y)
+    ifeq ($(call ld-option, --fix-cortex-a53-843419),n)
+        $(warning ld does not support --fix-cortex-a53-843419; xen may be susceptible to erratum)
+    else
+        LDFLAGS += --fix-cortex-a53-843419
+    endif
+endif
+
 $(TARGET)-syms: prelink.o xen.lds
 	$(LD) $(LDFLAGS) -T xen.lds -N prelink.o \
 	    $(BASEDIR)/common/symbols-dummy.o -o $(@D)/.$(@F).0
@@ -125,9 +133,7 @@ asm-offsets.s: $(TARGET_SUBARCH)/asm-offsets.c
 	$(CC) $(filter-out -flto,$(CFLAGS)) -S -o $@ $<
 
 xen.lds: xen.lds.S
-	$(CC) -P -E -Ui386 $(AFLAGS) -o $@ $<
-	sed -e 's/xen\.lds\.o:/xen\.lds:/g' <.xen.lds.d >.xen.lds.d.new
-	mv -f .xen.lds.d.new .xen.lds.d
+	$(CPP) -P $(AFLAGS) -MQ $@ -o $@ $<
 
 dtb.o: $(CONFIG_DTB_FILE)
 

@@ -174,7 +174,8 @@
 #define DMA_FSTS_IQE ((u64)1 << 4)
 #define DMA_FSTS_ICE ((u64)1 << 5)
 #define DMA_FSTS_ITE ((u64)1 << 6)
-#define DMA_FSTS_FAULTS    DMA_FSTS_PFO | DMA_FSTS_PPF | DMA_FSTS_AFO | DMA_FSTS_APF | DMA_FSTS_IQE | DMA_FSTS_ICE | DMA_FSTS_ITE
+#define DMA_FSTS_FAULTS (DMA_FSTS_PFO | DMA_FSTS_AFO | DMA_FSTS_APF | \
+                         DMA_FSTS_IQE | DMA_FSTS_ICE | DMA_FSTS_ITE)
 #define dma_fsts_fault_record_index(s) (((s) >> 8) & 0xff)
 
 /* FRCD_REG, 32 bits access */
@@ -450,17 +451,9 @@ struct qinval_entry {
     }q;
 };
 
-/* Order of queue invalidation pages(max is 8) */
-#define QINVAL_PAGE_ORDER   2
-
-#define QINVAL_ARCH_PAGE_ORDER  (QINVAL_PAGE_ORDER + PAGE_SHIFT_4K - PAGE_SHIFT)
-#define QINVAL_ARCH_PAGE_NR     ( QINVAL_ARCH_PAGE_ORDER < 0 ?  \
-                                1 :                             \
-                                1 << QINVAL_ARCH_PAGE_ORDER )
-
 /* Each entry is 16 bytes, so 2^8 entries per page */
 #define QINVAL_ENTRY_ORDER  ( PAGE_SHIFT - 4 )
-#define QINVAL_ENTRY_NR     (1 << (QINVAL_PAGE_ORDER + 8))
+#define QINVAL_MAX_ENTRY_NR (1u << (7 + QINVAL_ENTRY_ORDER))
 
 /* Status data flag */
 #define QINVAL_STAT_INIT  0
@@ -540,6 +533,7 @@ struct vtd_iommu {
     struct list_head ats_devices;
     unsigned long *domid_bitmap;  /* domain id bitmap */
     u16 *domid_map;               /* domain id mapping array */
+    uint32_t version;
 };
 
 #define INTEL_IOMMU_DEBUG(fmt, args...) \
@@ -548,5 +542,11 @@ struct vtd_iommu {
         if ( iommu_debug )  \
             dprintk(XENLOG_WARNING VTDPREFIX, fmt, ## args);    \
     } while(0)
+
+/* Register-based invalidation isn't supported by VT-d version 6 and beyond. */
+static inline bool has_register_based_invalidation(const struct vtd_iommu *vtd)
+{
+    return VER_MAJOR(vtd->version) < 6;
+}
 
 #endif

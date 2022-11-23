@@ -84,7 +84,7 @@ static const opcode_desc_t opcode_table[256] = {
     ByteOp|DstReg|SrcMem|ModRM, DstReg|SrcMem|ModRM,
     ByteOp|DstEax|SrcImm, DstEax|SrcImm, 0, ImplicitOps,
     /* 0x38 - 0x3F */
-    ByteOp|DstMem|SrcReg|ModRM, DstMem|SrcReg|ModRM,
+    ByteOp|DstReg|SrcMem|ModRM, DstReg|SrcMem|ModRM,
     ByteOp|DstReg|SrcMem|ModRM, DstReg|SrcMem|ModRM,
     ByteOp|DstEax|SrcImm, DstEax|SrcImm, 0, ImplicitOps,
     /* 0x40 - 0x4F */
@@ -362,7 +362,7 @@ static const struct twobyte_table {
     [0xc1] = { DstMem|SrcReg|ModRM },
     [0xc2] = { DstImplicit|SrcImmByte|ModRM, simd_any_fp, d8s_vl },
     [0xc3] = { DstMem|SrcReg|ModRM|Mov },
-    [0xc4] = { DstReg|SrcImmByte|ModRM, simd_packed_int, 1 },
+    [0xc4] = { DstImplicit|SrcImmByte|ModRM, simd_none, 1 },
     [0xc5] = { DstReg|SrcImmByte|ModRM|Mov },
     [0xc6] = { DstImplicit|SrcImmByte|ModRM, simd_packed_fp, d8s_vl },
     [0xc7] = { ImplicitOps|ModRM },
@@ -723,7 +723,7 @@ union vex {
 #define copy_VEX(ptr, vex) ({ \
     if ( !mode_64bit() ) \
         (vex).reg |= 8; \
-    (ptr)[0 - PFX_BYTES] = ext < ext_8f08 ? 0xc4 : 0x8f; \
+    gcc11_wrap(ptr)[0 - PFX_BYTES] = ext < ext_8f08 ? 0xc4 : 0x8f; \
     (ptr)[1 - PFX_BYTES] = (vex).raw[0]; \
     (ptr)[2 - PFX_BYTES] = (vex).raw[1]; \
     container_of((ptr) + 1 - PFX_BYTES, typeof(vex), raw[0]); \
@@ -1172,6 +1172,7 @@ static inline int mkec(uint8_t e, int32_t ec, ...)
 # define invoke_stub(pre, post, constraints...) do {                    \
     stub_exn.info = (union stub_exception_token) { .raw = ~0 };         \
     stub_exn.line = __LINE__; /* Utility outweighs livepatching cost */ \
+    block_speculation(); /* SCSB */                                     \
     asm volatile ( pre "\n\tINDIRECT_CALL %[stub]\n\t" post "\n"        \
                    ".Lret%=:\n\t"                                       \
                    ".pushsection .fixup,\"ax\"\n"                       \
@@ -2471,7 +2472,6 @@ x86_decode_onebyte(
     case 0x60: /* pusha */
     case 0x61: /* popa */
     case 0x62: /* bound */
-    case 0x82: /* Grp1 (x86/32 only) */
     case 0xc4: /* les */
     case 0xc5: /* lds */
     case 0xce: /* into */
@@ -2479,6 +2479,14 @@ x86_decode_onebyte(
     case 0xd5: /* aad */
     case 0xd6: /* salc */
         state->not_64bit = true;
+        break;
+
+    case 0x82: /* Grp1 (x86/32 only) */
+        state->not_64bit = true;
+        /* fall through */
+    case 0x80: case 0x81: case 0x83: /* Grp1 */
+        if ( (modrm_reg & 7) == 7 ) /* cmp */
+            state->desc = (state->desc & ByteOp) | DstNone | SrcMem;
         break;
 
     case 0x90: /* nop / pause */
@@ -2509,6 +2517,11 @@ x86_decode_onebyte(
 
     case 0xc8: /* enter imm16,imm8 */
         imm2 = insn_fetch_type(uint8_t);
+        break;
+
+    case 0xf6: case 0xf7: /* Grp3 */
+        if ( !(modrm_reg & 6) ) /* test */
+            state->desc = (state->desc & ByteOp) | DstNone | SrcMem;
         break;
 
     case 0xff: /* Grp5 */
@@ -2656,7 +2669,7 @@ x86_decode_twobyte(
         /* fall through */
     case X86EMUL_OPC_VEX_66(0, 0xc4): /* vpinsrw */
     case X86EMUL_OPC_EVEX_66(0, 0xc4): /* vpinsrw */
-        state->desc = DstReg | SrcMem16;
+        state->desc = DstImplicit | SrcMem16;
         break;
 
     case 0xf0:
@@ -3238,7 +3251,7 @@ x86_decode(
         {
             generate_exception_if(d & vSIB, EXC_UD);
             modrm_rm |= ((rex_prefix & 1) << 3) |
-                        (evex_encoded() && !evex.x) << 4;
+                        ((evex_encoded() && !evex.x) << 4);
             ea.type = OP_REG;
         }
         else if ( ad_bytes == 2 )
@@ -3285,7 +3298,7 @@ x86_decode(
                     ea.mem.off = insn_fetch_type(int16_t);
                 break;
             case 1:
-                ea.mem.off += insn_fetch_type(int8_t) << disp8scale;
+                ea.mem.off += insn_fetch_type(int8_t) * (1 << disp8scale);
                 break;
             case 2:
                 ea.mem.off += insn_fetch_type(int16_t);
@@ -3347,7 +3360,7 @@ x86_decode(
                 pc_rel = mode_64bit();
                 break;
             case 1:
-                ea.mem.off += insn_fetch_type(int8_t) << disp8scale;
+                ea.mem.off += insn_fetch_type(int8_t) * (1 << disp8scale);
                 break;
             case 2:
                 ea.mem.off += insn_fetch_type(int32_t);
@@ -3894,13 +3907,11 @@ x86_emulate(
         break;
 
     case 0x38: case 0x39: cmp: /* cmp reg,mem */
-        if ( ops->rmw && dst.type == OP_MEM &&
-             (rc = read_ulong(dst.mem.seg, dst.mem.off, &dst.val,
-                              dst.bytes, ctxt, ops)) != X86EMUL_OKAY )
-            goto done;
-        /* fall through */
+        emulate_2op_SrcV("cmp", dst, src, _regs.eflags);
+        dst.type = OP_NONE;
+        break;
+
     case 0x3a ... 0x3d: /* cmp */
-        generate_exception_if(lock_prefix, EXC_UD);
         emulate_2op_SrcV("cmp", src, dst, _regs.eflags);
         dst.type = OP_NONE;
         break;
@@ -4207,7 +4218,9 @@ x86_emulate(
         case 4: goto and;
         case 5: goto sub;
         case 6: goto xor;
-        case 7: goto cmp;
+        case 7:
+            dst.val = imm1;
+            goto cmp;
         }
         break;
 
@@ -5200,11 +5213,8 @@ x86_emulate(
             unsigned long u[2], v;
 
         case 0 ... 1: /* test */
-            generate_exception_if(lock_prefix, EXC_UD);
-            if ( ops->rmw && dst.type == OP_MEM &&
-                 (rc = read_ulong(dst.mem.seg, dst.mem.off, &dst.val,
-                                  dst.bytes, ctxt, ops)) != X86EMUL_OKAY )
-                goto done;
+            dst.val = imm1;
+            dst.bytes = src.bytes;
             goto test;
         case 2: /* not */
             if ( ops->rmw && dst.type == OP_MEM )
@@ -5917,6 +5927,10 @@ x86_emulate(
              (rc = ops->write_segment(x86_seg_ss, &sreg, ctxt)) )
             goto done;
 
+        if ( ctxt->lma )
+            /* In particular mode_64bit() needs to return true from here on. */
+            ctxt->addr_size = ctxt->sp_size = 64;
+
         /*
          * SYSCALL (unlike most instructions) evaluates its singlestep action
          * based on the resulting EFLAGS.TF, not the starting EFLAGS.TF.
@@ -6585,6 +6599,10 @@ x86_emulate(
                                  &msr_val, ctxt)) != X86EMUL_OKAY )
             goto done;
         _regs.r(sp) = ctxt->lma ? msr_val : (uint32_t)msr_val;
+
+        if ( ctxt->lma )
+            /* In particular mode_64bit() needs to return true from here on. */
+            ctxt->addr_size = ctxt->sp_size = 64;
 
         singlestep = _regs.eflags & X86_EFLAGS_TF;
         break;
@@ -8141,6 +8159,7 @@ x86_emulate(
         generate_exception_if(vex.l, EXC_UD);
         memcpy(mmvalp, &src.val, 2);
         ea.type = OP_MEM;
+        state->simd_size = simd_other;
         goto simd_0f_int_imm8;
 
     case X86EMUL_OPC_EVEX_66(0x0f, 0xc4):   /* vpinsrw $imm8,r32/m16,xmm,xmm */
@@ -8153,9 +8172,8 @@ x86_emulate(
             host_and_vcpu_must_have(avx512bw);
         if ( !mode_64bit() )
             evex.w = 0;
-        memcpy(mmvalp, &src.val, op_bytes);
+        memcpy(mmvalp, &src.val, src.bytes);
         ea.type = OP_MEM;
-        op_bytes = src.bytes;
         d = SrcMem16; /* Fake for the common SIMD code below. */
         state->simd_size = simd_other;
         goto avx512f_imm8_no_sae;
@@ -9254,7 +9272,7 @@ x86_emulate(
 
                 rc = ops->read(ea.mem.seg,
                                truncate_ea(ea.mem.off +
-                                           (idx << state->sib_scale)),
+                                           idx * (1 << state->sib_scale)),
                                (void *)mmvalp + i * op_bytes, op_bytes, ctxt);
                 if ( rc != X86EMUL_OKAY )
                 {
@@ -9376,7 +9394,8 @@ x86_emulate(
                 continue;
 
             rc = ops->read(ea.mem.seg,
-                           truncate_ea(ea.mem.off + (idx << state->sib_scale)),
+                           truncate_ea(ea.mem.off +
+                                       idx * (1 << state->sib_scale)),
                            (void *)mmvalp + i * op_bytes, op_bytes, ctxt);
             if ( rc != X86EMUL_OKAY )
             {
@@ -9547,7 +9566,8 @@ x86_emulate(
                 continue;
 
             rc = ops->write(ea.mem.seg,
-                            truncate_ea(ea.mem.off + (idx << state->sib_scale)),
+                            truncate_ea(ea.mem.off +
+                                        idx * (1 << state->sib_scale)),
                             (void *)mmvalp + i * op_bytes, op_bytes, ctxt);
             if ( rc != X86EMUL_OKAY )
             {
@@ -9665,7 +9685,7 @@ x86_emulate(
                   ? ops->write
                   : ops->read)(ea.mem.seg,
                                truncate_ea(ea.mem.off +
-                                           (idx << state->sib_scale)),
+                                           idx * (1 << state->sib_scale)),
                                NULL, 0, ctxt);
             if ( rc == X86EMUL_EXCEPTION )
             {
@@ -10226,10 +10246,8 @@ x86_emulate(
     case X86EMUL_OPC_66(0x0f3a, 0x20): /* pinsrb $imm8,r32/m8,xmm */
     case X86EMUL_OPC_66(0x0f3a, 0x22): /* pinsr{d,q} $imm8,r/m,xmm */
         host_and_vcpu_must_have(sse4_1);
-        get_fpu(X86EMUL_FPU_xmm);
-        memcpy(mmvalp, &src.val, op_bytes);
+        memcpy(mmvalp, &src.val, src.bytes);
         ea.type = OP_MEM;
-        op_bytes = src.bytes;
         d = SrcMem16; /* Fake for the common SIMD code below. */
         state->simd_size = simd_other;
         goto simd_0f3a_common;
@@ -10239,9 +10257,8 @@ x86_emulate(
         generate_exception_if(vex.l, EXC_UD);
         if ( !mode_64bit() )
             vex.w = 0;
-        memcpy(mmvalp, &src.val, op_bytes);
+        memcpy(mmvalp, &src.val, src.bytes);
         ea.type = OP_MEM;
-        op_bytes = src.bytes;
         d = SrcMem16; /* Fake for the common SIMD code below. */
         state->simd_size = simd_other;
         goto simd_0f_int_imm8;
@@ -11184,8 +11201,12 @@ int x86_emulate_wrapper(
     unsigned long orig_ip = ctxt->regs->r(ip);
     int rc;
 
+#ifdef __x86_64__
     if ( mode_64bit() )
         ASSERT(ctxt->lma);
+#else
+    ASSERT(!ctxt->lma && !mode_64bit());
+#endif
 
     rc = x86_emulate(ctxt, ops);
 
@@ -11318,24 +11339,86 @@ x86_insn_operand_ea(const struct x86_emulate_state *state,
     return state->ea.mem.off;
 }
 
+/*
+ * This function means to return 'true' for all supported insns with explicit
+ * accesses to memory.  This means also insns which don't have an explicit
+ * memory operand (like POP), but it does not mean e.g. segment selector
+ * loads, where the descriptor table access is considered an implicit one.
+ */
 bool
 x86_insn_is_mem_access(const struct x86_emulate_state *state,
                        const struct x86_emulate_ctxt *ctxt)
 {
+    if ( mode_64bit() && state->not_64bit )
+        return false;
+
     if ( state->ea.type == OP_MEM )
-        return ctxt->opcode != 0x8d /* LEA */ &&
-               (ctxt->opcode != X86EMUL_OPC(0x0f, 0x01) ||
-                (state->modrm_reg & 7) != 7) /* INVLPG */;
+    {
+        switch ( ctxt->opcode )
+        {
+        case 0x8d: /* LEA */
+        case X86EMUL_OPC(0x0f, 0x0d): /* PREFETCH */
+        case X86EMUL_OPC(0x0f, 0x18)
+         ... X86EMUL_OPC(0x0f, 0x1f): /* NOP space */
+        case X86EMUL_OPC_66(0x0f, 0x18)
+         ... X86EMUL_OPC_66(0x0f, 0x1f): /* NOP space */
+        case X86EMUL_OPC_F3(0x0f, 0x18)
+         ... X86EMUL_OPC_F3(0x0f, 0x1f): /* NOP space */
+        case X86EMUL_OPC_F2(0x0f, 0x18)
+         ... X86EMUL_OPC_F2(0x0f, 0x1f): /* NOP space */
+        case X86EMUL_OPC(0x0f, 0xb9): /* UD1 */
+        case X86EMUL_OPC(0x0f, 0xff): /* UD0 */
+            return false;
+
+        case X86EMUL_OPC(0x0f, 0x01):
+            return (state->modrm_reg & 7) != 7; /* INVLPG */
+
+        case X86EMUL_OPC(0x0f, 0xae):
+            return (state->modrm_reg & 7) != 7; /* CLFLUSH */
+
+        case X86EMUL_OPC_66(0x0f, 0xae):
+            return (state->modrm_reg & 7) < 6; /* CLWB, CLFLUSHOPT */
+        }
+
+        return true;
+    }
 
     switch ( ctxt->opcode )
     {
+    case 0x06 ... 0x07: /* PUSH / POP %es */
+    case 0x0e:          /* PUSH %cs */
+    case 0x16 ... 0x17: /* PUSH / POP %ss */
+    case 0x1e ... 0x1f: /* PUSH / POP %ds */
+    case 0x50 ... 0x5f: /* PUSH / POP reg */
+    case 0x60 ... 0x61: /* PUSHA / POPA */
+    case 0x68: case 0x6a: /* PUSH imm */
     case 0x6c ... 0x6f: /* INS / OUTS */
+    case 0x8f:          /* POP r/m */
+    case 0x9a:          /* CALL (far, direct) */
+    case 0x9c ... 0x9d: /* PUSHF / POPF */
     case 0xa4 ... 0xa7: /* MOVS / CMPS */
     case 0xaa ... 0xaf: /* STOS / LODS / SCAS */
+    case 0xc2 ... 0xc3: /* RET (near) */
+    case 0xc8 ... 0xc9: /* ENTER / LEAVE */
+    case 0xca ... 0xcb: /* RET (far) */
     case 0xd7:          /* XLAT */
+    case 0xe8:          /* CALL (near, direct) */
+    case X86EMUL_OPC(0x0f, 0xa0):         /* PUSH %fs */
+    case X86EMUL_OPC(0x0f, 0xa1):         /* POP %fs */
+    case X86EMUL_OPC(0x0f, 0xa8):         /* PUSH %gs */
+    case X86EMUL_OPC(0x0f, 0xa9):         /* POP %gs */
     CASE_SIMD_PACKED_INT(0x0f, 0xf7):    /* MASKMOV{Q,DQU} */
     case X86EMUL_OPC_VEX_66(0x0f, 0xf7): /* VMASKMOVDQU */
         return true;
+
+    case 0xff:
+        switch ( state->modrm_reg & 7 )
+        {
+        case 2: /* CALL (near, indirect) */
+        case 6: /* PUSH r/m */
+            return true;
+        }
+        break;
 
     case X86EMUL_OPC(0x0f, 0x01):
         /* Cover CLZERO. */
@@ -11345,10 +11428,20 @@ x86_insn_is_mem_access(const struct x86_emulate_state *state,
     return false;
 }
 
+/*
+ * This function means to return 'true' for all supported insns with explicit
+ * writes to memory.  This means also insns which don't have an explicit
+ * memory operand (like PUSH), but it does not mean e.g. segment selector
+ * loads, where the (possible) descriptor table write is considered an
+ * implicit access.
+ */
 bool
 x86_insn_is_mem_write(const struct x86_emulate_state *state,
                       const struct x86_emulate_ctxt *ctxt)
 {
+    if ( mode_64bit() && state->not_64bit )
+        return false;
+
     switch ( state->desc & DstMask )
     {
     case DstMem:
@@ -11360,19 +11453,48 @@ x86_insn_is_mem_write(const struct x86_emulate_state *state,
         break;
 
     default:
+        switch ( ctxt->opcode )
+        {
+        case 0x63:                         /* ARPL */
+            return !mode_64bit();
+        }
+
         return false;
     }
 
     if ( state->modrm_mod == 3 )
-        /* CLZERO is the odd one. */
-        return ctxt->opcode == X86EMUL_OPC(0x0f, 0x01) &&
-               (state->modrm_rm & 7) == 4 && (state->modrm_reg & 7) == 7;
+    {
+        switch ( ctxt->opcode )
+        {
+        case 0xff: /* Grp5 */
+            break;
+
+        case X86EMUL_OPC(0x0f, 0x01): /* CLZERO is the odd one. */
+            return (state->modrm_rm & 7) == 4 && (state->modrm_reg & 7) == 7;
+
+        default:
+            return false;
+        }
+    }
 
     switch ( ctxt->opcode )
     {
+    case 0x06:                           /* PUSH %es */
+    case 0x0e:                           /* PUSH %cs */
+    case 0x16:                           /* PUSH %ss */
+    case 0x1e:                           /* PUSH %ds */
+    case 0x50 ... 0x57:                  /* PUSH reg */
+    case 0x60:                           /* PUSHA */
+    case 0x68: case 0x6a:                /* PUSH imm */
     case 0x6c: case 0x6d:                /* INS */
+    case 0x9a:                           /* CALL (far, direct) */
+    case 0x9c:                           /* PUSHF */
     case 0xa4: case 0xa5:                /* MOVS */
     case 0xaa: case 0xab:                /* STOS */
+    case 0xc8:                           /* ENTER */
+    case 0xe8:                           /* CALL (near, direct) */
+    case X86EMUL_OPC(0x0f, 0xa0):        /* PUSH %fs */
+    case X86EMUL_OPC(0x0f, 0xa8):        /* PUSH %gs */
     case X86EMUL_OPC(0x0f, 0xab):        /* BTS */
     case X86EMUL_OPC(0x0f, 0xb3):        /* BTR */
     case X86EMUL_OPC(0x0f, 0xbb):        /* BTC */
@@ -11430,6 +11552,16 @@ x86_insn_is_mem_write(const struct x86_emulate_state *state,
         }
         break;
 
+    case 0xff:
+        switch ( state->modrm_reg & 7 )
+        {
+        case 2: /* CALL (near, indirect) */
+        case 3: /* CALL (far, indirect) */
+        case 6: /* PUSH r/m */
+            return true;
+        }
+        break;
+
     case X86EMUL_OPC(0x0f, 0x01):
         switch ( state->modrm_reg & 7 )
         {
@@ -11444,7 +11576,7 @@ x86_insn_is_mem_write(const struct x86_emulate_state *state,
         switch ( state->modrm_reg & 7 )
         {
         case 0: /* FXSAVE */
-        case 3: /* {,V}STMXCSR */
+        /* case 3: STMXCSR - handled above */
         case 4: /* XSAVE */
         case 6: /* XSAVEOPT */
             return true;
@@ -11460,7 +11592,6 @@ x86_insn_is_mem_write(const struct x86_emulate_state *state,
         case 1: /* CMPXCHG{8,16}B */
         case 4: /* XSAVEC */
         case 5: /* XSAVES */
-        case 7: /* VMPTRST */
             return true;
         }
         break;

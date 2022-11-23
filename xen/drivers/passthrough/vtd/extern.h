@@ -43,14 +43,22 @@ void disable_qinval(struct vtd_iommu *iommu);
 int enable_intremap(struct vtd_iommu *iommu, int eim);
 void disable_intremap(struct vtd_iommu *iommu);
 
-void iommu_flush_cache_entry(void *addr, unsigned int size);
-void iommu_flush_cache_page(void *addr, unsigned long npages);
 int iommu_alloc(struct acpi_drhd_unit *drhd);
 void iommu_free(struct acpi_drhd_unit *drhd);
 
 int iommu_flush_iec_global(struct vtd_iommu *iommu);
 int iommu_flush_iec_index(struct vtd_iommu *iommu, u8 im, u16 iidx);
 void clear_fault_bits(struct vtd_iommu *iommu);
+
+int __must_check vtd_flush_context_reg(struct vtd_iommu *iommu, uint16_t did,
+                                       uint16_t source_id,
+                                       uint8_t function_mask, uint64_t type,
+                                       bool flush_non_present_entry);
+int __must_check vtd_flush_iotlb_reg(struct vtd_iommu *iommu, uint16_t did,
+                                     uint64_t addr, unsigned int size_order,
+                                     uint64_t type,
+                                     bool flush_non_present_entry,
+                                     bool flush_dev_iotlb);
 
 struct vtd_iommu *ioapic_to_iommu(unsigned int apic_id);
 struct vtd_iommu *hpet_to_iommu(unsigned int hpet_id);
@@ -70,7 +78,6 @@ int __must_check qinval_device_iotlb_sync(struct vtd_iommu *iommu,
                                           u16 did, u16 size, u64 addr);
 
 unsigned int get_cache_line_size(void);
-void cacheline_flush(char *);
 void flush_all_cache(void);
 
 uint64_t alloc_pgtable_maddr(unsigned long npages, nodeid_t node);

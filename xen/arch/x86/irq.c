@@ -1504,7 +1504,7 @@ void (pirq_cleanup_check)(struct pirq *pirq, struct domain *d)
     }
 
     if ( radix_tree_delete(&d->pirq_tree, pirq->pirq) != pirq )
-        BUG_ON(!d->is_dying);
+        BUG();
 }
 
 /* Flush all ready EOIs from the top of this CPU's pending-EOI stack. */
@@ -2474,14 +2474,22 @@ static void dump_irqs(unsigned char key)
 
             for ( i = 0; i < action->nr_guests; )
             {
+                struct evtchn *evtchn;
+                unsigned int pending = 2, masked = 2;
+
                 d = action->guest[i++];
                 pirq = domain_irq_to_pirq(d, irq);
                 info = pirq_info(d, pirq);
+                evtchn = evtchn_from_port(d, info->evtchn);
+                if ( evtchn_read_trylock(evtchn) )
+                {
+                    pending = evtchn_is_pending(d, evtchn);
+                    masked = evtchn_is_masked(d, evtchn);
+                    evtchn_read_unlock(evtchn);
+                }
                 printk("d%d:%3d(%c%c%c)%c",
-                       d->domain_id, pirq,
-                       evtchn_port_is_pending(d, info->evtchn) ? 'P' : '-',
-                       evtchn_port_is_masked(d, info->evtchn) ? 'M' : '-',
-                       info->masked ? 'M' : '-',
+                       d->domain_id, pirq, "-P?"[pending],
+                       "-M?"[masked], info->masked ? 'M' : '-',
                        i < action->nr_guests ? ',' : '\n');
             }
         }

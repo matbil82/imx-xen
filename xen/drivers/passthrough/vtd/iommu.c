@@ -31,6 +31,7 @@
 #include <xen/pci_regs.h>
 #include <xen/keyhandler.h>
 #include <asm/msi.h>
+#include <asm/nops.h>
 #include <asm/irq.h>
 #include <asm/hvm/vmx/vmx.h>
 #include <asm/p2m.h>
@@ -40,12 +41,6 @@
 #include "extern.h"
 #include "vtd.h"
 #include "../ats.h"
-
-struct mapped_rmrr {
-    struct list_head list;
-    u64 base, end;
-    unsigned int count;
-};
 
 /* Possible unfiltered LAPIC/MSI messages from untrusted sources? */
 bool __read_mostly untrusted_msi;
@@ -72,9 +67,11 @@ static int domain_iommu_domid(struct domain *d,
         i = find_next_bit(iommu->domid_bitmap, nr_dom, i+1);
     }
 
-    dprintk(XENLOG_ERR VTDPREFIX,
-            "Cannot get valid iommu domid: domid=%d iommu->index=%d\n",
-            d->domain_id, iommu->index);
+    if ( !d->is_dying )
+        dprintk(XENLOG_ERR VTDPREFIX,
+                "Cannot get valid iommu %u domid: %pd\n",
+                iommu->index, d);
+
     return -1;
 }
 
@@ -139,11 +136,23 @@ static int context_get_domain_id(struct context_entry *context,
     return domid;
 }
 
-static int iommus_incoherent;
-static void __iommu_flush_cache(void *addr, unsigned int size)
+static void cleanup_domid_map(struct domain *domain, struct vtd_iommu *iommu)
 {
-    int i;
-    static unsigned int clflush_size = 0;
+    int iommu_domid = domain_iommu_domid(domain, iommu);
+
+    if ( iommu_domid >= 0 )
+    {
+        clear_bit(iommu_domid, iommu->domid_bitmap);
+        iommu->domid_map[iommu_domid] = 0;
+    }
+}
+
+static int iommus_incoherent;
+
+static void sync_cache(const void *addr, unsigned int size)
+{
+    static unsigned long clflush_size = 0;
+    const void *end = addr + size;
 
     if ( !iommus_incoherent )
         return;
@@ -151,18 +160,44 @@ static void __iommu_flush_cache(void *addr, unsigned int size)
     if ( clflush_size == 0 )
         clflush_size = get_cache_line_size();
 
-    for ( i = 0; i < size; i += clflush_size )
-        cacheline_flush((char *)addr + i);
-}
+    addr -= (unsigned long)addr & (clflush_size - 1);
+    for ( ; addr < end; addr += clflush_size )
+/*
+ * The arguments to a macro must not include preprocessor directives. Doing so
+ * results in undefined behavior, so we have to create some defines here in
+ * order to avoid it.
+ */
+#if defined(HAVE_AS_CLWB)
+# define CLWB_ENCODING "clwb %[p]"
+#elif defined(HAVE_AS_XSAVEOPT)
+# define CLWB_ENCODING "data16 xsaveopt %[p]" /* clwb */
+#else
+# define CLWB_ENCODING ".byte 0x66, 0x0f, 0xae, 0x30" /* clwb (%%rax) */
+#endif
 
-void iommu_flush_cache_entry(void *addr, unsigned int size)
-{
-    __iommu_flush_cache(addr, size);
-}
+#define BASE_INPUT(addr) [p] "m" (*(const char *)(addr))
+#if defined(HAVE_AS_CLWB) || defined(HAVE_AS_XSAVEOPT)
+# define INPUT BASE_INPUT
+#else
+# define INPUT(addr) "a" (addr), BASE_INPUT(addr)
+#endif
+        /*
+         * Note regarding the use of NOP_DS_PREFIX: it's faster to do a clflush
+         * + prefix than a clflush + nop, and hence the prefix is added instead
+         * of letting the alternative framework fill the gap by appending nops.
+         */
+        alternative_io_2(".byte " __stringify(NOP_DS_PREFIX) "; clflush %[p]",
+                         "data16 clflush %[p]", /* clflushopt */
+                         X86_FEATURE_CLFLUSHOPT,
+                         CLWB_ENCODING,
+                         X86_FEATURE_CLWB, /* no outputs */,
+                         INPUT(addr));
+#undef INPUT
+#undef BASE_INPUT
+#undef CLWB_ENCODING
 
-void iommu_flush_cache_page(void *addr, unsigned long npages)
-{
-    __iommu_flush_cache(addr, PAGE_SIZE * npages);
+    alternative_2("", "sfence", X86_FEATURE_CLFLUSHOPT,
+                      "sfence", X86_FEATURE_CLWB);
 }
 
 /* Allocate page table, return its machine address */
@@ -183,7 +218,7 @@ uint64_t alloc_pgtable_maddr(unsigned long npages, nodeid_t node)
         vaddr = __map_domain_page(cur_pg);
         memset(vaddr, 0, PAGE_SIZE);
 
-        iommu_flush_cache_page(vaddr, 1);
+        sync_cache(vaddr, PAGE_SIZE);
         unmap_domain_page(vaddr);
         cur_pg++;
     }
@@ -216,7 +251,7 @@ static u64 bus_to_context_maddr(struct vtd_iommu *iommu, u8 bus)
         }
         set_root_value(*root, maddr);
         set_root_present(*root);
-        iommu_flush_cache_entry(root, sizeof(struct root_entry));
+        iommu_sync_cache(root, sizeof(struct root_entry));
     }
     maddr = (u64) get_context_addr(*root);
     unmap_vtd_domain_page(root_entries);
@@ -263,7 +298,7 @@ static u64 addr_to_dma_page_maddr(struct domain *domain, u64 addr, int alloc)
              */
             dma_set_pte_readable(*pte);
             dma_set_pte_writable(*pte);
-            iommu_flush_cache_entry(pte, sizeof(struct dma_pte));
+            iommu_sync_cache(pte, sizeof(struct dma_pte));
         }
 
         if ( level == 2 )
@@ -292,17 +327,16 @@ static void iommu_flush_write_buffer(struct vtd_iommu *iommu)
     dmar_writel(iommu->reg, DMAR_GCMD_REG, val | DMA_GCMD_WBF);
 
     /* Make sure hardware complete it */
-    IOMMU_WAIT_OP(iommu, DMAR_GSTS_REG, dmar_readl,
-                  !(val & DMA_GSTS_WBFS), val);
+    IOMMU_FLUSH_WAIT("write buffer", iommu, DMAR_GSTS_REG, dmar_readl,
+                     !(val & DMA_GSTS_WBFS), val);
 
     spin_unlock_irqrestore(&iommu->register_lock, flags);
 }
 
 /* return value determine if we need a write buffer flush */
-static int __must_check flush_context_reg(struct vtd_iommu *iommu, u16 did,
-                                          u16 source_id, u8 function_mask,
-                                          u64 type,
-                                          bool flush_non_present_entry)
+int vtd_flush_context_reg(struct vtd_iommu *iommu, uint16_t did,
+                          uint16_t source_id, uint8_t function_mask,
+                          uint64_t type, bool flush_non_present_entry)
 {
     u64 val = 0;
     unsigned long flags;
@@ -343,8 +377,8 @@ static int __must_check flush_context_reg(struct vtd_iommu *iommu, u16 did,
     dmar_writeq(iommu->reg, DMAR_CCMD_REG, val);
 
     /* Make sure hardware complete it */
-    IOMMU_WAIT_OP(iommu, DMAR_CCMD_REG, dmar_readq,
-                  !(val & DMA_CCMD_ICC), val);
+    IOMMU_FLUSH_WAIT("context", iommu, DMAR_CCMD_REG, dmar_readq,
+                     !(val & DMA_CCMD_ICC), val);
 
     spin_unlock_irqrestore(&iommu->register_lock, flags);
     /* flush context entry will implicitly flush write buffer */
@@ -368,11 +402,9 @@ static int __must_check iommu_flush_context_device(struct vtd_iommu *iommu,
 }
 
 /* return value determine if we need a write buffer flush */
-static int __must_check flush_iotlb_reg(struct vtd_iommu *iommu, u16 did,
-                                        u64 addr,
-                                        unsigned int size_order, u64 type,
-                                        bool flush_non_present_entry,
-                                        bool flush_dev_iotlb)
+int vtd_flush_iotlb_reg(struct vtd_iommu *iommu, uint16_t did, uint64_t addr,
+                        unsigned int size_order, uint64_t type,
+                        bool flush_non_present_entry, bool flush_dev_iotlb)
 {
     int tlb_offset = ecap_iotlb_offset(iommu->ecap);
     u64 val = 0;
@@ -423,8 +455,8 @@ static int __must_check flush_iotlb_reg(struct vtd_iommu *iommu, u16 did,
     dmar_writeq(iommu->reg, tlb_offset + 8, val);
 
     /* Make sure hardware complete it */
-    IOMMU_WAIT_OP(iommu, (tlb_offset + 8), dmar_readq,
-                  !(val & DMA_TLB_IVT), val);
+    IOMMU_FLUSH_WAIT("iotlb", iommu, (tlb_offset + 8), dmar_readq,
+                     !(val & DMA_TLB_IVT), val);
     spin_unlock_irqrestore(&iommu->register_lock, flags);
 
     /* check IOTLB invalidation granularity */
@@ -552,7 +584,7 @@ static int __must_check iommu_flush_iotlb(struct domain *d, dfn_t dfn,
     struct vtd_iommu *iommu;
     bool_t flush_dev_iotlb;
     int iommu_domid;
-    int rc = 0;
+    int ret = 0;
 
     /*
      * No need pcideves_lock here because we have flush
@@ -560,6 +592,8 @@ static int __must_check iommu_flush_iotlb(struct domain *d, dfn_t dfn,
      */
     for_each_drhd_unit ( drhd )
     {
+        int rc;
+
         iommu = drhd->iommu;
 
         if ( !test_bit(iommu->index, &hd->arch.iommu_bitmap) )
@@ -570,24 +604,24 @@ static int __must_check iommu_flush_iotlb(struct domain *d, dfn_t dfn,
         if ( iommu_domid == -1 )
             continue;
 
-        if ( page_count != 1 || dfn_eq(dfn, INVALID_DFN) )
+        if ( !page_count || (page_count & (page_count - 1)) ||
+             dfn_eq(dfn, INVALID_DFN) || !IS_ALIGNED(dfn_x(dfn), page_count) )
             rc = iommu_flush_iotlb_dsi(iommu, iommu_domid,
                                        0, flush_dev_iotlb);
         else
             rc = iommu_flush_iotlb_psi(iommu, iommu_domid,
                                        dfn_to_daddr(dfn),
-                                       PAGE_ORDER_4K,
+                                       get_order_from_pages(page_count),
                                        !dma_old_pte_present,
                                        flush_dev_iotlb);
 
         if ( rc > 0 )
-        {
             iommu_flush_write_buffer(iommu);
-            rc = 0;
-        }
+        else if ( !ret )
+            ret = rc;
     }
 
-    return rc;
+    return ret;
 }
 
 static int __must_check iommu_flush_iotlb_pages(struct domain *d,
@@ -639,7 +673,7 @@ static int __must_check dma_pte_clear_one(struct domain *domain, u64 addr,
     *flush_flags |= IOMMU_FLUSHF_modified;
 
     spin_unlock(&hd->arch.mapping_lock);
-    iommu_flush_cache_entry(pte, sizeof(struct dma_pte));
+    iommu_sync_cache(pte, sizeof(struct dma_pte));
 
     unmap_vtd_domain_page(page);
 
@@ -678,7 +712,7 @@ static void iommu_free_page_table(struct page_info *pg)
             iommu_free_pagetable(dma_pte_addr(*pte), next_level);
 
         dma_clear_pte(*pte);
-        iommu_flush_cache_entry(pte, sizeof(struct dma_pte));
+        iommu_sync_cache(pte, sizeof(struct dma_pte));
     }
 
     unmap_vtd_domain_page(pt_vaddr);
@@ -1131,10 +1165,10 @@ int __init iommu_alloc(struct acpi_drhd_unit *drhd)
     unsigned long sagaw, nr_dom;
     int agaw;
 
-    if ( nr_iommus > MAX_IOMMUS )
+    if ( nr_iommus >= MAX_IOMMUS )
     {
         dprintk(XENLOG_ERR VTDPREFIX,
-                 "IOMMU: nr_iommus %d > MAX_IOMMUS\n", nr_iommus);
+                "IOMMU: nr_iommus %d > MAX_IOMMUS\n", nr_iommus + 1);
         return -ENOMEM;
     }
 
@@ -1159,6 +1193,14 @@ int __init iommu_alloc(struct acpi_drhd_unit *drhd)
 
     iommu->cap = dmar_readq(iommu->reg, DMAR_CAP_REG);
     iommu->ecap = dmar_readq(iommu->reg, DMAR_ECAP_REG);
+    iommu->version = dmar_readl(iommu->reg, DMAR_VER_REG);
+
+    if ( !iommu_qinval && !has_register_based_invalidation(iommu) )
+    {
+        printk(XENLOG_WARNING VTDPREFIX "IOMMU %d: cannot disable Queued Invalidation\n",
+               iommu->index);
+        iommu_qinval = true;
+    }
 
     if ( iommu_verbose )
     {
@@ -1399,7 +1441,7 @@ int domain_context_mapping_one(
     context_set_address_width(*context, agaw);
     context_set_fault_enable(*context);
     context_set_present(*context);
-    iommu_flush_cache_entry(context, sizeof(struct context_entry));
+    iommu_sync_cache(context, sizeof(struct context_entry));
     spin_unlock(&iommu->lock);
 
     /* Context entry was previously non-present (with domid 0). */
@@ -1429,8 +1471,14 @@ int domain_context_mapping_one(
     if ( !seg && !rc )
         rc = me_wifi_quirk(domain, bus, devfn, MAP_ME_PHANTOM_FUNC);
 
+    if ( rc )
+        domain_context_unmap_one(domain, iommu, bus, devfn);
+
     return rc;
 }
+
+static int domain_context_unmap(struct domain *d, uint8_t devfn,
+                                struct pci_dev *pdev);
 
 static int domain_context_mapping(struct domain *domain, u8 devfn,
                                   struct pci_dev *pdev)
@@ -1495,16 +1543,21 @@ static int domain_context_mapping(struct domain *domain, u8 devfn,
         if ( ret )
             break;
 
-        if ( find_upstream_bridge(seg, &bus, &devfn, &secbus) < 1 )
-            break;
+        if ( (ret = find_upstream_bridge(seg, &bus, &devfn, &secbus)) < 1 )
+        {
+            if ( !ret )
+                break;
+            ret = -ENXIO;
+        }
 
         /*
          * Mapping a bridge should, if anything, pass the struct pci_dev of
          * that bridge. Since bridges don't normally get assigned to guests,
          * their owner would be the wrong one. Pass NULL instead.
          */
-        ret = domain_context_mapping_one(domain, drhd->iommu, bus, devfn,
-                                         NULL);
+        if ( ret >= 0 )
+            ret = domain_context_mapping_one(domain, drhd->iommu, bus, devfn,
+                                             NULL);
 
         /*
          * Devices behind PCIe-to-PCI/PCIx bridge may generate different
@@ -1520,6 +1573,9 @@ static int domain_context_mapping(struct domain *domain, u8 devfn,
              (secbus != pdev->bus || pdev->devfn != 0) )
             ret = domain_context_mapping_one(domain, drhd->iommu, secbus, 0,
                                              NULL);
+
+        if ( ret )
+            domain_context_unmap(domain, devfn, pdev);
 
         break;
 
@@ -1563,7 +1619,7 @@ int domain_context_unmap_one(
 
     context_clear_present(*context);
     context_clear_entry(*context);
-    iommu_flush_cache_entry(context, sizeof(struct context_entry));
+    iommu_sync_cache(context, sizeof(struct context_entry));
 
     iommu_domid= domain_iommu_domid(domain, iommu);
     if ( iommu_domid == -1 )
@@ -1599,6 +1655,19 @@ int domain_context_unmap_one(
 
     if ( !iommu->drhd->segment && !rc )
         rc = me_wifi_quirk(domain, bus, devfn, UNMAP_ME_PHANTOM_FUNC);
+
+    if ( rc && !is_hardware_domain(domain) && domain != dom_io )
+    {
+        if ( domain->is_dying )
+        {
+            printk(XENLOG_ERR "%pd: error %d unmapping %04x:%02x:%02x.%u\n",
+                   domain, rc, iommu->drhd->segment, bus,
+                   PCI_SLOT(devfn), PCI_FUNC(devfn));
+            rc = 0; /* Make upper layers continue in a best effort manner. */
+        }
+        else
+            domain_crash(domain);
+    }
 
     return rc;
 }
@@ -1654,17 +1723,29 @@ static int domain_context_unmap(struct domain *domain, u8 devfn,
 
         tmp_bus = bus;
         tmp_devfn = devfn;
-        if ( find_upstream_bridge(seg, &tmp_bus, &tmp_devfn, &secbus) < 1 )
+        if ( (ret = find_upstream_bridge(seg, &tmp_bus, &tmp_devfn,
+                                         &secbus)) < 1 )
+        {
+            if ( ret )
+            {
+                ret = -ENXIO;
+                if ( !domain->is_dying &&
+                     !is_hardware_domain(domain) && domain != dom_io )
+                {
+                    domain_crash(domain);
+                    /* Make upper layers continue in a best effort manner. */
+                    ret = 0;
+                }
+            }
             break;
+        }
 
         /* PCIe to PCI/PCIx bridge */
         if ( pdev_type(seg, tmp_bus, tmp_devfn) == DEV_TYPE_PCIe2PCI_BRIDGE )
         {
             ret = domain_context_unmap_one(domain, iommu, tmp_bus, tmp_devfn);
-            if ( ret )
-                return ret;
-
-            ret = domain_context_unmap_one(domain, iommu, secbus, 0);
+            if ( !ret )
+                ret = domain_context_unmap_one(domain, iommu, secbus, 0);
         }
         else /* Legacy PCI bridge */
             ret = domain_context_unmap_one(domain, iommu, tmp_bus, tmp_devfn);
@@ -1678,6 +1759,9 @@ static int domain_context_unmap(struct domain *domain, u8 devfn,
         ret = -EINVAL;
         goto out;
     }
+
+    if ( ret )
+        goto out;
 
     /*
      * if no other devices under the same iommu owned by this domain,
@@ -1698,19 +1782,8 @@ static int domain_context_unmap(struct domain *domain, u8 devfn,
 
     if ( found == 0 )
     {
-        int iommu_domid;
-
         clear_bit(iommu->index, &dom_iommu(domain)->arch.iommu_bitmap);
-
-        iommu_domid = domain_iommu_domid(domain, iommu);
-        if ( iommu_domid == -1 )
-        {
-            ret = -EINVAL;
-            goto out;
-        }
-
-        clear_bit(iommu_domid, iommu->domid_bitmap);
-        iommu->domid_map[iommu_domid] = 0;
+        cleanup_domid_map(domain, iommu);
     }
 
 out:
@@ -1720,16 +1793,12 @@ out:
 static void iommu_domain_teardown(struct domain *d)
 {
     struct domain_iommu *hd = dom_iommu(d);
-    struct mapped_rmrr *mrmrr, *tmp;
+    const struct acpi_drhd_unit *drhd;
 
     if ( list_empty(&acpi_drhd_units) )
         return;
 
-    list_for_each_entry_safe ( mrmrr, tmp, &hd->arch.mapped_rmrrs, list )
-    {
-        list_del(&mrmrr->list);
-        xfree(mrmrr);
-    }
+    iommu_identity_map_teardown(d);
 
     ASSERT(is_iommu_enabled(d));
 
@@ -1740,6 +1809,9 @@ static void iommu_domain_teardown(struct domain *d)
     iommu_free_pagetable(hd->arch.pgd_maddr, agaw_to_level(hd->arch.agaw));
     hd->arch.pgd_maddr = 0;
     spin_unlock(&hd->arch.mapping_lock);
+
+    for_each_drhd_unit ( drhd )
+        cleanup_domid_map(d, drhd->iommu);
 }
 
 static int __must_check intel_iommu_map_page(struct domain *d, dfn_t dfn,
@@ -1790,7 +1862,7 @@ static int __must_check intel_iommu_map_page(struct domain *d, dfn_t dfn,
 
     *pte = new;
 
-    iommu_flush_cache_entry(pte, sizeof(struct dma_pte));
+    iommu_sync_cache(pte, sizeof(struct dma_pte));
     spin_unlock(&hd->arch.mapping_lock);
     unmap_vtd_domain_page(page);
 
@@ -1855,53 +1927,6 @@ static int intel_iommu_lookup_page(struct domain *d, dfn_t dfn, mfn_t *mfn,
     return 0;
 }
 
-int iommu_pte_flush(struct domain *d, uint64_t dfn, uint64_t *pte,
-                    int order, int present)
-{
-    struct acpi_drhd_unit *drhd;
-    struct vtd_iommu *iommu = NULL;
-    struct domain_iommu *hd = dom_iommu(d);
-    bool_t flush_dev_iotlb;
-    int iommu_domid;
-    int rc = 0;
-
-    iommu_flush_cache_entry(pte, sizeof(struct dma_pte));
-
-    for_each_drhd_unit ( drhd )
-    {
-        iommu = drhd->iommu;
-        if ( !test_bit(iommu->index, &hd->arch.iommu_bitmap) )
-            continue;
-
-        flush_dev_iotlb = !!find_ats_dev_drhd(iommu);
-        iommu_domid= domain_iommu_domid(d, iommu);
-        if ( iommu_domid == -1 )
-            continue;
-
-        rc = iommu_flush_iotlb_psi(iommu, iommu_domid,
-                                   __dfn_to_daddr(dfn),
-                                   order, !present, flush_dev_iotlb);
-        if ( rc > 0 )
-        {
-            iommu_flush_write_buffer(iommu);
-            rc = 0;
-        }
-    }
-
-    if ( unlikely(rc) )
-    {
-        if ( !d->is_shutting_down && printk_ratelimit() )
-            printk(XENLOG_ERR VTDPREFIX
-                   " d%d: IOMMU pages flush failed: %d\n",
-                   d->domain_id, rc);
-
-        if ( !is_hardware_domain(d) )
-            domain_crash(d);
-    }
-
-    return rc;
-}
-
 static int __init vtd_ept_page_compatible(struct vtd_iommu *iommu)
 {
     u64 ept_cap, vtd_cap = iommu->cap;
@@ -1925,74 +1950,6 @@ static void iommu_set_pgd(struct domain *d)
     pgd_mfn = pagetable_get_mfn(p2m_get_pagetable(p2m_get_hostp2m(d)));
     dom_iommu(d)->arch.pgd_maddr =
         pagetable_get_paddr(pagetable_from_mfn(pgd_mfn));
-}
-
-static int rmrr_identity_mapping(struct domain *d, bool_t map,
-                                 const struct acpi_rmrr_unit *rmrr,
-                                 u32 flag)
-{
-    unsigned long base_pfn = rmrr->base_address >> PAGE_SHIFT_4K;
-    unsigned long end_pfn = PAGE_ALIGN_4K(rmrr->end_address) >> PAGE_SHIFT_4K;
-    struct mapped_rmrr *mrmrr;
-    struct domain_iommu *hd = dom_iommu(d);
-
-    ASSERT(pcidevs_locked());
-    ASSERT(rmrr->base_address < rmrr->end_address);
-
-    /*
-     * No need to acquire hd->arch.mapping_lock: Both insertion and removal
-     * get done while holding pcidevs_lock.
-     */
-    list_for_each_entry( mrmrr, &hd->arch.mapped_rmrrs, list )
-    {
-        if ( mrmrr->base == rmrr->base_address &&
-             mrmrr->end == rmrr->end_address )
-        {
-            int ret = 0;
-
-            if ( map )
-            {
-                ++mrmrr->count;
-                return 0;
-            }
-
-            if ( --mrmrr->count )
-                return 0;
-
-            while ( base_pfn < end_pfn )
-            {
-                if ( clear_identity_p2m_entry(d, base_pfn) )
-                    ret = -ENXIO;
-                base_pfn++;
-            }
-
-            list_del(&mrmrr->list);
-            xfree(mrmrr);
-            return ret;
-        }
-    }
-
-    if ( !map )
-        return -ENOENT;
-
-    while ( base_pfn < end_pfn )
-    {
-        int err = set_identity_p2m_entry(d, base_pfn, p2m_access_rw, flag);
-
-        if ( err )
-            return err;
-        base_pfn++;
-    }
-
-    mrmrr = xmalloc(struct mapped_rmrr);
-    if ( !mrmrr )
-        return -ENOMEM;
-    mrmrr->base = rmrr->base_address;
-    mrmrr->end = rmrr->end_address;
-    mrmrr->count = 1;
-    list_add_tail(&mrmrr->list, &hd->arch.mapped_rmrrs);
-
-    return 0;
 }
 
 static int intel_iommu_add_device(u8 devfn, struct pci_dev *pdev)
@@ -2026,7 +1983,9 @@ static int intel_iommu_add_device(u8 devfn, struct pci_dev *pdev)
              * Since RMRRs are always reserved in the e820 map for the hardware
              * domain, there shouldn't be a conflict.
              */
-            ret = rmrr_identity_mapping(pdev->domain, 1, rmrr, 0);
+            ret = iommu_identity_mapping(pdev->domain, p2m_access_rw,
+                                         rmrr->base_address, rmrr->end_address,
+                                         0);
             if ( ret )
                 dprintk(XENLOG_ERR VTDPREFIX, "d%d: RMRR mapping failed\n",
                         pdev->domain->domain_id);
@@ -2071,7 +2030,8 @@ static int intel_iommu_remove_device(u8 devfn, struct pci_dev *pdev)
          * Any flag is nothing to clear these mappings but here
          * its always safe and strict to set 0.
          */
-        rmrr_identity_mapping(pdev->domain, 0, rmrr, 0);
+        iommu_identity_mapping(pdev->domain, p2m_access_x, rmrr->base_address,
+                               rmrr->end_address, 0);
     }
 
     return domain_context_unmap(pdev->domain, devfn, pdev);
@@ -2084,13 +2044,23 @@ static int __hwdom_init setup_hwdom_device(u8 devfn, struct pci_dev *pdev)
 
 void clear_fault_bits(struct vtd_iommu *iommu)
 {
-    u64 val;
     unsigned long flags;
 
     spin_lock_irqsave(&iommu->register_lock, flags);
-    val = dmar_readq(iommu->reg, cap_fault_reg_offset(iommu->cap) + 8);
-    dmar_writeq(iommu->reg, cap_fault_reg_offset(iommu->cap) + 8, val);
+
+    if ( dmar_readl(iommu->reg, DMAR_FSTS_REG) & DMA_FSTS_PPF )
+    {
+        unsigned int reg = cap_fault_reg_offset(iommu->cap);
+        unsigned int end = reg + cap_num_fault_regs(iommu->cap);
+
+        do {
+           dmar_writel(iommu->reg, reg + 12, DMA_FRCD_F);
+           reg += PRIMARY_FAULT_REG_LEN;
+        } while ( reg < end );
+    }
+
     dmar_writel(iommu->reg, DMAR_FSTS_REG, DMA_FSTS_FAULTS);
+
     spin_unlock_irqrestore(&iommu->register_lock, flags);
 }
 
@@ -2127,7 +2097,7 @@ static int adjust_vtd_irq_affinities(void)
 }
 __initcall(adjust_vtd_irq_affinities);
 
-static int __must_check init_vtd_hw(void)
+static int __must_check init_vtd_hw(bool resume)
 {
     struct acpi_drhd_unit *drhd;
     struct vtd_iommu *iommu;
@@ -2136,7 +2106,7 @@ static int __must_check init_vtd_hw(void)
     u32 sts;
 
     /*
-     * Basic VT-d HW init: set VT-d interrupt, clear VT-d faults.  
+     * Basic VT-d HW init: set VT-d interrupt, clear VT-d faults, etc.
      */
     for_each_drhd_unit ( drhd )
     {
@@ -2145,6 +2115,20 @@ static int __must_check init_vtd_hw(void)
         iommu = drhd->iommu;
 
         clear_fault_bits(iommu);
+
+        /*
+         * Disable interrupt remapping and queued invalidation if
+         * already enabled by BIOS in case we've not initialized it yet.
+         */
+        if ( !x2apic_enabled )
+        {
+            disable_intremap(iommu);
+            disable_qinval(iommu);
+        }
+
+        if ( resume )
+            /* FECTL write done by vtd_resume(). */
+            continue;
 
         spin_lock_irqsave(&iommu->register_lock, flags);
         sts = dmar_readl(iommu->reg, DMAR_FECTL_REG);
@@ -2165,8 +2149,12 @@ static int __must_check init_vtd_hw(void)
          */
         if ( enable_qinval(iommu) != 0 )
         {
-            iommu->flush.context = flush_context_reg;
-            iommu->flush.iotlb   = flush_iotlb_reg;
+            /* Ensure register-based invalidation is available */
+            if ( !has_register_based_invalidation(iommu) )
+                return -EIO;
+
+            iommu->flush.context = vtd_flush_context_reg;
+            iommu->flush.iotlb   = vtd_flush_iotlb_reg;
         }
     }
 
@@ -2242,7 +2230,8 @@ static void __hwdom_init setup_hwdom_rmrr(struct domain *d)
          * domain, there shouldn't be a conflict. So its always safe and
          * strict to set 0.
          */
-        ret = rmrr_identity_mapping(d, 1, rmrr, 0);
+        ret = iommu_identity_mapping(d, p2m_access_rw, rmrr->base_address,
+                                     rmrr->end_address, 0);
         if ( ret )
             dprintk(XENLOG_ERR VTDPREFIX,
                      "IOMMU: mapping reserved region failed\n");
@@ -2255,6 +2244,7 @@ static int __init vtd_setup(void)
     struct acpi_drhd_unit *drhd;
     struct vtd_iommu *iommu;
     int ret;
+    bool reg_inval_supported = true;
 
     if ( list_empty(&acpi_drhd_units) )
     {
@@ -2276,8 +2266,8 @@ static int __init vtd_setup(void)
     }
 
     /* We enable the following features only if they are supported by all VT-d
-     * engines: Snoop Control, DMA passthrough, Queued Invalidation, Interrupt
-     * Remapping, and Posted Interrupt
+     * engines: Snoop Control, DMA passthrough, Register-based Invalidation,
+     * Queued Invalidation, Interrupt Remapping, and Posted Interrupt.
      */
     for_each_drhd_unit ( drhd )
     {
@@ -2296,6 +2286,9 @@ static int __init vtd_setup(void)
 
         if ( iommu_qinval && !ecap_queued_inval(iommu->ecap) )
             iommu_qinval = 0;
+
+        if ( !has_register_based_invalidation(iommu) )
+            reg_inval_supported = false;
 
         if ( iommu_intremap && !ecap_intr_remap(iommu->ecap) )
             iommu_intremap = 0;
@@ -2321,6 +2314,13 @@ static int __init vtd_setup(void)
 
     softirq_tasklet_init(&vtd_fault_tasklet, do_iommu_page_fault, 0);
 
+    if ( !iommu_qinval && !reg_inval_supported )
+    {
+        dprintk(XENLOG_ERR VTDPREFIX, "No available invalidation interface\n");
+        ret = -ENODEV;
+        goto error;
+    }
+
     if ( !iommu_qinval && iommu_intremap )
     {
         iommu_intremap = 0;
@@ -2337,7 +2337,7 @@ static int __init vtd_setup(void)
     P(iommu_hap_pt_share, "Shared EPT tables");
 #undef P
 
-    ret = init_vtd_hw();
+    ret = init_vtd_hw(false);
     if ( ret )
         goto error;
 
@@ -2390,8 +2390,10 @@ static int reassign_device_ownership(
                  * Any RMRR flag is always ignored when remove a device,
                  * but its always safe and strict to set 0.
                  */
-                ret = rmrr_identity_mapping(source, 0, rmrr, 0);
-                if ( ret != -ENOENT )
+                ret = iommu_identity_mapping(source, p2m_access_x,
+                                             rmrr->base_address,
+                                             rmrr->end_address, 0);
+                if ( ret && ret != -ENOENT )
                     return ret;
             }
     }
@@ -2487,7 +2489,8 @@ static int intel_iommu_assign_device(
              PCI_BUS(bdf) == bus &&
              PCI_DEVFN2(bdf) == devfn )
         {
-            ret = rmrr_identity_mapping(d, 1, rmrr, flag);
+            ret = iommu_identity_mapping(d, p2m_access_rw, rmrr->base_address,
+                                         rmrr->end_address, flag);
             if ( ret )
             {
                 int rc;
@@ -2604,7 +2607,22 @@ static void vtd_resume(void)
     if ( !iommu_enabled )
         return;
 
-    if ( init_vtd_hw() != 0  && force_iommu )
+    for_each_drhd_unit ( drhd )
+    {
+        iommu = drhd->iommu;
+        i = iommu->index;
+
+        spin_lock_irqsave(&iommu->register_lock, flags);
+        dmar_writel(iommu->reg, DMAR_FEDATA_REG,
+                    iommu_state[i][DMAR_FEDATA_REG]);
+        dmar_writel(iommu->reg, DMAR_FEADDR_REG,
+                    iommu_state[i][DMAR_FEADDR_REG]);
+        dmar_writel(iommu->reg, DMAR_FEUADDR_REG,
+                    iommu_state[i][DMAR_FEUADDR_REG]);
+        spin_unlock_irqrestore(&iommu->register_lock, flags);
+    }
+
+    if ( init_vtd_hw(true) != 0 && force_iommu )
          panic("IOMMU setup failed, crash Xen for security purpose\n");
 
     for_each_drhd_unit ( drhd )
@@ -2615,12 +2633,6 @@ static void vtd_resume(void)
         spin_lock_irqsave(&iommu->register_lock, flags);
         dmar_writel(iommu->reg, DMAR_FECTL_REG,
                     (u32) iommu_state[i][DMAR_FECTL_REG]);
-        dmar_writel(iommu->reg, DMAR_FEDATA_REG,
-                    (u32) iommu_state[i][DMAR_FEDATA_REG]);
-        dmar_writel(iommu->reg, DMAR_FEADDR_REG,
-                    (u32) iommu_state[i][DMAR_FEADDR_REG]);
-        dmar_writel(iommu->reg, DMAR_FEUADDR_REG,
-                    (u32) iommu_state[i][DMAR_FEUADDR_REG]);
         spin_unlock_irqrestore(&iommu->register_lock, flags);
 
         iommu_enable_translation(drhd);
@@ -2723,7 +2735,7 @@ static int __init intel_iommu_quarantine_init(struct domain *d)
             dma_set_pte_addr(*pte, maddr);
             dma_set_pte_readable(*pte);
         }
-        iommu_flush_cache_page(parent, 1);
+        iommu_sync_cache(parent, PAGE_SIZE);
 
         unmap_vtd_domain_page(parent);
         parent = map_vtd_domain_page(maddr);
@@ -2771,6 +2783,7 @@ const struct iommu_ops __initconstrel intel_iommu_ops = {
     .iotlb_flush_all = iommu_flush_iotlb_all,
     .get_reserved_device_memory = intel_iommu_get_reserved_device_memory,
     .dump_p2m_table = vtd_dump_p2m_table,
+    .sync_cache = sync_cache,
 };
 
 const struct iommu_init_ops __initconstrel intel_iommu_init_ops = {

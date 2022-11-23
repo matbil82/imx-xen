@@ -59,7 +59,7 @@ mm_printk(const char *fmt, ...) {}
     {                                       \
         dprintk(XENLOG_ERR, fmt, ## args);  \
         WARN();                             \
-    } while (0);
+    } while (0)
 #endif
 
 /*
@@ -1033,6 +1033,7 @@ static int xen_pt_next_level(bool read_only, unsigned int level,
 {
     lpae_t *entry;
     int ret;
+    mfn_t mfn;
 
     entry = *table + offset;
 
@@ -1050,8 +1051,10 @@ static int xen_pt_next_level(bool read_only, unsigned int level,
     if ( lpae_is_mapping(*entry, level) )
         return XEN_TABLE_SUPER_PAGE;
 
+    mfn = lpae_get_mfn(*entry);
+
     xen_unmap_table(*table);
-    *table = xen_map_table(lpae_get_mfn(*entry));
+    *table = xen_map_table(mfn);
 
     return XEN_TABLE_NORMAL_PAGE;
 }
@@ -1407,7 +1410,7 @@ void share_xen_page_with_guest(struct page_info *page, struct domain *d,
 int xenmem_add_to_physmap_one(
     struct domain *d,
     unsigned int space,
-    union xen_add_to_physmap_batch_extra extra,
+    union add_to_physmap_extra extra,
     unsigned long idx,
     gfn_t gfn)
 {
@@ -1423,6 +1426,8 @@ int xenmem_add_to_physmap_one(
         if ( rc )
             return rc;
 
+        /* Need to take care of the reference obtained in gnttab_map_frame(). */
+        page = mfn_to_page(mfn);
         t = p2m_ram_rw;
 
         break;
@@ -1480,10 +1485,6 @@ int xenmem_add_to_physmap_one(
         break;
     }
     case XENMAPSPACE_dev_mmio:
-        /* extra should be 0. Reserved for future use. */
-        if ( extra.res0 )
-            return -EOPNOTSUPP;
-
         rc = map_dev_mmio_region(d, gfn, 1, _mfn(idx));
         return rc;
 
@@ -1494,9 +1495,12 @@ int xenmem_add_to_physmap_one(
     /* Map at new location. */
     rc = guest_physmap_add_entry(d, gfn, mfn, 0, t);
 
-    /* If we fail to add the mapping, we need to drop the reference we
-     * took earlier on foreign pages */
-    if ( rc && space == XENMAPSPACE_gmfn_foreign )
+    /*
+     * For XENMAPSPACE_gmfn_foreign if we failed to add the mapping, we need
+     * to drop the reference we took earlier. In all other cases we need to
+     * drop any reference we took earlier (perhaps indirectly).
+     */
+    if ( space == XENMAPSPACE_gmfn_foreign ? rc : page != NULL )
     {
         ASSERT(page != NULL);
         put_page(page);

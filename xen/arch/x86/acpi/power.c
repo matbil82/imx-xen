@@ -286,7 +286,9 @@ static int enter_state(u32 state)
     console_end_sync();
     watchdog_enable();
 
-    microcode_update_one(true);
+    microcode_update_one();
+
+    tsx_init(); /* Needs microcode.  May change HLE/RTM feature bits. */
 
     if ( !recheck_cpu_features(0) )
         panic("Missing previously available feature(s)\n");

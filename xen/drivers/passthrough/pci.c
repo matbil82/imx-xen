@@ -842,10 +842,10 @@ int pci_remove_device(u16 seg, u8 bus, u8 devfn)
     list_for_each_entry ( pdev, &pseg->alldevs_list, alldevs_list )
         if ( pdev->bus == bus && pdev->devfn == devfn )
         {
+            pci_cleanup_msi(pdev);
             ret = iommu_remove_device(pdev);
             if ( pdev->domain )
                 list_del(&pdev->domain_list);
-            pci_cleanup_msi(pdev);
             free_pdev(pseg, pdev);
             printk(XENLOG_DEBUG "PCI remove device %04x:%02x:%02x.%u\n",
                    seg, bus, PCI_SLOT(devfn), PCI_FUNC(devfn));
@@ -861,6 +861,10 @@ static int pci_clean_dpci_irq(struct domain *d,
 {
     struct dev_intx_gsi_link *digl, *tmp;
 
+    if ( !pirq_dpci->flags )
+        /* Already processed. */
+        return 0;
+
     pirq_guest_unbind(d, dpci_pirq(pirq_dpci));
 
     if ( pt_irq_need_timer(pirq_dpci->flags) )
@@ -871,15 +875,10 @@ static int pci_clean_dpci_irq(struct domain *d,
         list_del(&digl->list);
         xfree(digl);
     }
+    /* Note the pirq is now unbound. */
+    pirq_dpci->flags = 0;
 
-    radix_tree_delete(&d->pirq_tree, dpci_pirq(pirq_dpci)->pirq);
-
-    if ( !pt_pirq_softirq_active(pirq_dpci) )
-        return 0;
-
-    domain_get_irq_dpci(d)->pending_pirq_dpci = pirq_dpci;
-
-    return -ERESTART;
+    return pt_pirq_softirq_active(pirq_dpci) ? -ERESTART : 0;
 }
 
 static int pci_clean_dpci_irqs(struct domain *d)
@@ -896,18 +895,8 @@ static int pci_clean_dpci_irqs(struct domain *d)
     hvm_irq_dpci = domain_get_irq_dpci(d);
     if ( hvm_irq_dpci != NULL )
     {
-        int ret = 0;
+        int ret = pt_pirq_iterate(d, pci_clean_dpci_irq, NULL);
 
-        if ( hvm_irq_dpci->pending_pirq_dpci )
-        {
-            if ( pt_pirq_softirq_active(hvm_irq_dpci->pending_pirq_dpci) )
-                 ret = -ERESTART;
-            else
-                 hvm_irq_dpci->pending_pirq_dpci = NULL;
-        }
-
-        if ( !ret )
-            ret = pt_pirq_iterate(d, pci_clean_dpci_irq, NULL);
         if ( ret )
         {
             spin_unlock(&d->event_lock);
@@ -979,7 +968,7 @@ static int deassign_device(struct domain *d, uint16_t seg, uint8_t bus,
 
 int pci_release_devices(struct domain *d)
 {
-    struct pci_dev *pdev;
+    struct pci_dev *pdev, *tmp;
     u8 bus, devfn;
     int ret;
 
@@ -990,18 +979,15 @@ int pci_release_devices(struct domain *d)
         pcidevs_unlock();
         return ret;
     }
-    while ( (pdev = pci_get_pdev_by_domain(d, -1, -1, -1)) )
+    list_for_each_entry_safe ( pdev, tmp, &d->pdev_list, domain_list )
     {
         bus = pdev->bus;
         devfn = pdev->devfn;
-        if ( deassign_device(d, pdev->seg, bus, devfn) )
-            printk("domain %d: deassign device (%04x:%02x:%02x.%u) failed!\n",
-                   d->domain_id, pdev->seg, bus,
-                   PCI_SLOT(devfn), PCI_FUNC(devfn));
+        ret = deassign_device(d, pdev->seg, bus, devfn) ?: ret;
     }
     pcidevs_unlock();
 
-    return 0;
+    return ret;
 }
 
 #define PCI_CLASS_BRIDGE_HOST    0x0600

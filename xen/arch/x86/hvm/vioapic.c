@@ -260,7 +260,7 @@ static void vioapic_write_redirent(
         pent->fields.remote_irr = 0;
     else if ( !ent.fields.mask &&
               !ent.fields.remote_irr &&
-              hvm_irq->gsi_assert_count[idx] )
+              hvm_irq->gsi_assert_count[gsi] )
     {
         pent->fields.remote_irr = 1;
         vioapic_deliver(vioapic, idx);
@@ -539,12 +539,12 @@ void vioapic_update_EOI(struct domain *d, u8 vector)
             if ( is_iommu_enabled(d) )
             {
                 spin_unlock(&d->arch.hvm.irq_lock);
-                hvm_dpci_eoi(d, vioapic->base_gsi + pin, ent);
+                hvm_dpci_eoi(d, vioapic->base_gsi + pin);
                 spin_lock(&d->arch.hvm.irq_lock);
             }
 
             if ( (ent->fields.trig_mode == VIOAPIC_LEVEL_TRIG) &&
-                 !ent->fields.mask &&
+                 !ent->fields.mask && !ent->fields.remote_irr &&
                  hvm_irq->gsi_assert_count[vioapic->base_gsi + pin] )
             {
                 ent->fields.remote_irr = 1;
@@ -619,7 +619,10 @@ static int ioapic_load(struct domain *d, hvm_domain_context_t *h)
          d->arch.hvm.nr_vioapics != 1 )
         return -EOPNOTSUPP;
 
-    return hvm_load_entry(IOAPIC, h, &s->domU);
+    if ( hvm_load_entry(IOAPIC, h, &s->domU) )
+        return -ENODATA;
+
+    return 0;
 }
 
 HVM_REGISTER_SAVE_RESTORE(IOAPIC, ioapic_save, ioapic_load, 1, HVMSR_PER_DOM);

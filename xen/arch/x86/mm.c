@@ -1236,8 +1236,14 @@ void put_page_from_l1e(l1_pgentry_t l1e, struct domain *l1e_owner)
      *
      * (Note that the undestroyable active grants are not a security hole in
      * Xen. All active grants can safely be cleaned up when the domain dies.)
+     *
+     * NB: the preprocessor conditional is required in order to prevent clang's
+     * -Wtautological-constant-compare complaining about converting the result
+     * of a << into a bool is always true if it's evaluated directly in the if
+     * condition.
      */
-    if ( _PAGE_GNTTAB && (l1e_get_flags(l1e) & _PAGE_GNTTAB) &&
+#if _PAGE_GNTTAB
+    if ( (l1e_get_flags(l1e) & _PAGE_GNTTAB) &&
          !l1e_owner->is_shutting_down && !l1e_owner->is_dying )
     {
         gdprintk(XENLOG_WARNING,
@@ -1245,6 +1251,7 @@ void put_page_from_l1e(l1_pgentry_t l1e, struct domain *l1e_owner)
                  l1e_get_intpte(l1e));
         domain_crash(l1e_owner);
     }
+#endif
 
     /*
      * Remember we didn't take a type-count of foreign writable mappings
@@ -2158,6 +2165,50 @@ void page_unlock(struct page_info *page)
     } while ( (y = cmpxchg(&page->u.inuse.type_info, x, nx)) != x );
 
     current_locked_page_set(NULL);
+}
+
+/*
+ * L3 table locks:
+ *
+ * Used for serialization in map_pages_to_xen() and modify_xen_mappings().
+ *
+ * For Xen PT pages, the page->u.inuse.type_info is unused and it is safe to
+ * reuse the PGT_locked flag. This lock is taken only when we move down to L3
+ * tables and below, since L4 (and above, for 5-level paging) is still globally
+ * protected by map_pgdir_lock.
+ *
+ * PV MMU update hypercalls call map_pages_to_xen while holding a page's page_lock().
+ * This has two implications:
+ * - We cannot reuse reuse current_locked_page_* for debugging
+ * - To avoid the chance of deadlock, even for different pages, we
+ *   must never grab page_lock() after grabbing l3t_lock().  This
+ *   includes any page_lock()-based locks, such as
+ *   mem_sharing_page_lock().
+ *
+ * Also note that we grab the map_pgdir_lock while holding the
+ * l3t_lock(), so to avoid deadlock we must avoid grabbing them in
+ * reverse order.
+ */
+static void l3t_lock(struct page_info *page)
+{
+    unsigned long x, nx;
+
+    do {
+        while ( (x = page->u.inuse.type_info) & PGT_locked )
+            cpu_relax();
+        nx = x | PGT_locked;
+    } while ( cmpxchg(&page->u.inuse.type_info, x, nx) != x );
+}
+
+static void l3t_unlock(struct page_info *page)
+{
+    unsigned long x, nx, y = page->u.inuse.type_info;
+
+    do {
+        x = y;
+        BUG_ON(!(x & PGT_locked));
+        nx = x & ~PGT_locked;
+    } while ( (y = cmpxchg(&page->u.inuse.type_info, x, nx)) != x );
 }
 
 #ifdef CONFIG_PV
@@ -3918,7 +3969,8 @@ long do_mmu_update(
     struct vcpu *curr = current, *v = curr;
     struct domain *d = v->domain, *pt_owner = d, *pg_owner;
     mfn_t map_mfn = INVALID_MFN, mfn;
-    bool sync_guest = false;
+    bool flush_linear_pt = false, flush_root_pt_local = false,
+        flush_root_pt_others = false;
     uint32_t xsm_needed = 0;
     uint32_t xsm_checked = 0;
     int rc = put_old_guest_table(curr);
@@ -4068,6 +4120,8 @@ long do_mmu_update(
                         break;
                     rc = mod_l2_entry(va, l2e_from_intpte(req.val), mfn,
                                       cmd == MMU_PT_UPDATE_PRESERVE_AD, v);
+                    if ( !rc )
+                        flush_linear_pt = true;
                     break;
 
                 case PGT_l3_page_table:
@@ -4075,6 +4129,8 @@ long do_mmu_update(
                         break;
                     rc = mod_l3_entry(va, l3e_from_intpte(req.val), mfn,
                                       cmd == MMU_PT_UPDATE_PRESERVE_AD, v);
+                    if ( !rc )
+                        flush_linear_pt = true;
                     break;
 
                 case PGT_l4_page_table:
@@ -4082,6 +4138,8 @@ long do_mmu_update(
                         break;
                     rc = mod_l4_entry(va, l4e_from_intpte(req.val), mfn,
                                       cmd == MMU_PT_UPDATE_PRESERVE_AD, v);
+                    if ( !rc )
+                        flush_linear_pt = true;
                     if ( !rc && pt_owner->arch.pv.xpti )
                     {
                         bool local_in_use = false;
@@ -4090,7 +4148,7 @@ long do_mmu_update(
                                     mfn) )
                         {
                             local_in_use = true;
-                            get_cpu_info()->root_pgt_changed = true;
+                            flush_root_pt_local = true;
                         }
 
                         /*
@@ -4102,7 +4160,7 @@ long do_mmu_update(
                              (1 + !!(page->u.inuse.type_info & PGT_pinned) +
                               mfn_eq(pagetable_get_mfn(curr->arch.guest_table_user),
                                      mfn) + local_in_use) )
-                            sync_guest = true;
+                            flush_root_pt_others = true;
                     }
                     break;
 
@@ -4204,19 +4262,61 @@ long do_mmu_update(
     if ( va )
         unmap_domain_page(va);
 
-    if ( sync_guest )
+    /*
+     * Perform required TLB maintenance.
+     *
+     * This logic currently depend on flush_linear_pt being a superset of the
+     * flush_root_pt_* conditions.
+     *
+     * pt_owner may not be current->domain.  This may occur during
+     * construction of 32bit PV guests, or debugging of PV guests.  The
+     * behaviour cannot be correct with domain unpaused.  We therefore expect
+     * pt_owner->dirty_cpumask to be empty, but it is a waste of effort to
+     * explicitly check for, and exclude, this corner case.
+     *
+     * flush_linear_pt requires a FLUSH_TLB to all dirty CPUs.  The flush must
+     * be performed now to maintain correct behaviour across a multicall.
+     * i.e. we cannot relax FLUSH_TLB to FLUSH_ROOT_PGTBL, given that the
+     * former is a side effect of the latter, because the resync (which is in
+     * the return-to-guest path) happens too late.
+     *
+     * flush_root_pt_* requires FLUSH_ROOT_PGTBL on either the local CPU
+     * (implies pt_owner == current->domain and current->processor set in
+     * pt_owner->dirty_cpumask), and/or all *other* dirty CPUs as there are
+     * references we can't account for locally.
+     */
+    if ( flush_linear_pt /* || flush_root_pt_local || flush_root_pt_others */ )
     {
-        /*
-         * Force other vCPU-s of the affected guest to pick up L4 entry
-         * changes (if any).
-         */
         unsigned int cpu = smp_processor_id();
-        cpumask_t *mask = per_cpu(scratch_cpumask, cpu);
+        cpumask_t *mask = pt_owner->dirty_cpumask;
 
-        cpumask_andnot(mask, pt_owner->dirty_cpumask, cpumask_of(cpu));
+        /*
+         * Always handle local flushing separately (if applicable), to
+         * separate the flush invocations appropriately for scope of the two
+         * flush_root_pt_* variables.
+         */
+        if ( likely(cpumask_test_cpu(cpu, mask)) )
+        {
+            mask = per_cpu(scratch_cpumask, cpu);
+
+            cpumask_copy(mask, pt_owner->dirty_cpumask);
+            __cpumask_clear_cpu(cpu, mask);
+
+            flush_local(FLUSH_TLB |
+                        (flush_root_pt_local ? FLUSH_ROOT_PGTBL : 0));
+        }
+        else
+            /* Sanity check.  flush_root_pt_local implies local cpu is dirty. */
+            ASSERT(!flush_root_pt_local);
+
+        /* Flush the remote dirty CPUs.  Does not include the local CPU. */
         if ( !cpumask_empty(mask) )
-            flush_mask(mask, FLUSH_TLB_GLOBAL | FLUSH_ROOT_PGTBL);
+            flush_mask(mask, FLUSH_TLB |
+                       (flush_root_pt_others ? FLUSH_ROOT_PGTBL : 0));
     }
+    else
+        /* Sanity check.  flush_root_pt_* implies flush_linear_pt. */
+        ASSERT(!flush_root_pt_local && !flush_root_pt_others);
 
     perfc_add(num_page_updates, i);
 
@@ -4617,7 +4717,7 @@ static int handle_iomem_range(unsigned long s, unsigned long e, void *p)
 int xenmem_add_to_physmap_one(
     struct domain *d,
     unsigned int space,
-    union xen_add_to_physmap_batch_extra extra,
+    union add_to_physmap_extra extra,
     unsigned long idx,
     gfn_t gpfn)
 {
@@ -4638,6 +4738,8 @@ int xenmem_add_to_physmap_one(
             rc = gnttab_map_frame(d, idx, gpfn, &mfn);
             if ( rc )
                 return rc;
+            /* Need to take care of the ref obtained in gnttab_map_frame(). */
+            page = mfn_to_page(mfn);
             break;
         case XENMAPSPACE_gmfn:
         {
@@ -4668,9 +4770,23 @@ int xenmem_add_to_physmap_one(
         goto put_both;
     }
 
-    /* Remove previously mapped page if it was present. */
+    /*
+     * Note that we're (ab)using GFN locking (to really be locking of the
+     * entire P2M) here in (at least) two ways: Finer grained locking would
+     * expose lock order violations in the XENMAPSPACE_gmfn case (due to the
+     * earlier get_gfn_unshare() above). Plus at the very least for the grant
+     * table v2 status page case we need to guarantee that the same page can
+     * only appear at a single GFN. While this is a property we want in
+     * general, for pages which can subsequently be freed this imperative:
+     * Upon freeing we wouldn't be able to find other mappings in the P2M
+     * (unless we did a brute force search).
+     */
     prev_mfn = get_gfn(d, gfn_x(gpfn), &p2mt);
-    if ( mfn_valid(prev_mfn) )
+
+    /* Remove previously mapped page if it was present. */
+    if ( p2mt == p2m_mmio_direct )
+        rc = -EPERM;
+    else if ( mfn_valid(prev_mfn) )
     {
         if ( is_xen_heap_mfn(prev_mfn) )
             /* Xen heap frames are simply unhooked from this phys slot. */
@@ -4679,31 +4795,36 @@ int xenmem_add_to_physmap_one(
             /* Normal domain memory is freed, to avoid leaking memory. */
             rc = guest_remove_page(d, gfn_x(gpfn));
     }
-    /* In the XENMAPSPACE_gmfn case we still hold a ref on the old page. */
-    put_gfn(d, gfn_x(gpfn));
-
-    if ( rc )
-        goto put_both;
 
     /* Unmap from old location, if any. */
     old_gpfn = get_gpfn_from_mfn(mfn_x(mfn));
     ASSERT(!SHARED_M2P(old_gpfn));
     if ( space == XENMAPSPACE_gmfn && old_gpfn != gfn )
-    {
         rc = -EXDEV;
-        goto put_both;
-    }
-    if ( old_gpfn != INVALID_M2P_ENTRY )
+    else if ( !rc && old_gpfn != INVALID_M2P_ENTRY )
         rc = guest_physmap_remove_page(d, _gfn(old_gpfn), mfn, PAGE_ORDER_4K);
 
     /* Map at new location. */
     if ( !rc )
         rc = guest_physmap_add_page(d, gpfn, mfn, PAGE_ORDER_4K);
 
+    put_gfn(d, gfn_x(gpfn));
+
  put_both:
-    /* In the XENMAPSPACE_gmfn case, we took a ref of the gfn at the top. */
+    /*
+     * In the XENMAPSPACE_gmfn case, we took a ref of the gfn at the top.
+     * We also may need to transfer ownership of the page reference to our
+     * caller.
+     */
     if ( space == XENMAPSPACE_gmfn )
+    {
         put_gfn(d, gfn);
+        if ( !rc && extra.ppage )
+        {
+            *extra.ppage = page;
+            page = NULL;
+        }
+    }
 
     if ( page )
         put_page(page);
@@ -5170,6 +5291,23 @@ l1_pgentry_t *virt_to_xen_l1e(unsigned long v)
                          flush_area_local((const void *)v, f) : \
                          flush_area_all((const void *)v, f))
 
+#define L3T_INIT(page) (page) = ZERO_BLOCK_PTR
+
+#define L3T_LOCK(page)        \
+    do {                      \
+        if ( locking )        \
+            l3t_lock(page);   \
+    } while ( false )
+
+#define L3T_UNLOCK(page)                           \
+    do {                                           \
+        if ( locking && (page) != ZERO_BLOCK_PTR ) \
+        {                                          \
+            l3t_unlock(page);                      \
+            (page) = ZERO_BLOCK_PTR;               \
+        }                                          \
+    } while ( false )
+
 int map_pages_to_xen(
     unsigned long virt,
     mfn_t mfn,
@@ -5180,6 +5318,8 @@ int map_pages_to_xen(
     l2_pgentry_t *pl2e, ol2e;
     l1_pgentry_t *pl1e, ol1e;
     unsigned int  i;
+    int rc = -ENOMEM;
+    struct page_info *current_l3page;
 
 #define flush_flags(oldf) do {                 \
     unsigned int o_ = (oldf);                  \
@@ -5195,12 +5335,20 @@ int map_pages_to_xen(
     }                                          \
 } while (0)
 
+    L3T_INIT(current_l3page);
+
     while ( nr_mfns != 0 )
     {
-        l3_pgentry_t ol3e, *pl3e = virt_to_xen_l3e(virt);
+        l3_pgentry_t *pl3e, ol3e;
 
+        L3T_UNLOCK(current_l3page);
+
+        pl3e = virt_to_xen_l3e(virt);
         if ( !pl3e )
-            return -ENOMEM;
+            goto out;
+
+        current_l3page = virt_to_page(pl3e);
+        L3T_LOCK(current_l3page);
         ol3e = *pl3e;
 
         if ( cpu_has_page1gb &&
@@ -5288,7 +5436,7 @@ int map_pages_to_xen(
 
             pl2e = alloc_xen_pagetable();
             if ( pl2e == NULL )
-                return -ENOMEM;
+                goto out;
 
             for ( i = 0; i < L2_PAGETABLE_ENTRIES; i++ )
                 l2e_write(pl2e + i,
@@ -5317,7 +5465,7 @@ int map_pages_to_xen(
 
         pl2e = virt_to_xen_l2e(virt);
         if ( !pl2e )
-            return -ENOMEM;
+            goto out;
 
         if ( ((((virt >> PAGE_SHIFT) | mfn_x(mfn)) &
                ((1u << PAGETABLE_ORDER) - 1)) == 0) &&
@@ -5360,7 +5508,7 @@ int map_pages_to_xen(
             {
                 pl1e = virt_to_xen_l1e(virt);
                 if ( pl1e == NULL )
-                    return -ENOMEM;
+                    goto out;
             }
             else if ( l2e_get_flags(*pl2e) & _PAGE_PSE )
             {
@@ -5387,7 +5535,7 @@ int map_pages_to_xen(
 
                 pl1e = alloc_xen_pagetable();
                 if ( pl1e == NULL )
-                    return -ENOMEM;
+                    goto out;
 
                 for ( i = 0; i < L1_PAGETABLE_ENTRIES; i++ )
                     l1e_write(&pl1e[i],
@@ -5531,7 +5679,11 @@ int map_pages_to_xen(
 
 #undef flush_flags
 
-    return 0;
+    rc = 0;
+
+ out:
+    L3T_UNLOCK(current_l3page);
+    return rc;
 }
 
 int populate_pt_range(unsigned long virt, unsigned long nr_mfns)
@@ -5558,6 +5710,8 @@ int modify_xen_mappings(unsigned long s, unsigned long e, unsigned int nf)
     l1_pgentry_t *pl1e;
     unsigned int  i;
     unsigned long v = s;
+    int rc = -ENOMEM;
+    struct page_info *current_l3page;
 
     /* Set of valid PTE bits which may be altered. */
 #define FLAGS_MASK (_PAGE_NX|_PAGE_RW|_PAGE_PRESENT)
@@ -5566,11 +5720,22 @@ int modify_xen_mappings(unsigned long s, unsigned long e, unsigned int nf)
     ASSERT(IS_ALIGNED(s, PAGE_SIZE));
     ASSERT(IS_ALIGNED(e, PAGE_SIZE));
 
+    L3T_INIT(current_l3page);
+
     while ( v < e )
     {
-        l3_pgentry_t *pl3e = virt_to_xen_l3e(v);
+        l3_pgentry_t *pl3e;
 
-        if ( !pl3e || !(l3e_get_flags(*pl3e) & _PAGE_PRESENT) )
+        L3T_UNLOCK(current_l3page);
+
+        pl3e = virt_to_xen_l3e(v);
+        if ( !pl3e )
+            goto out;
+
+        current_l3page = virt_to_page(pl3e);
+        L3T_LOCK(current_l3page);
+
+        if ( !(l3e_get_flags(*pl3e) & _PAGE_PRESENT) )
         {
             /* Confirm the caller isn't trying to create new mappings. */
             ASSERT(!(nf & _PAGE_PRESENT));
@@ -5599,7 +5764,8 @@ int modify_xen_mappings(unsigned long s, unsigned long e, unsigned int nf)
             /* PAGE1GB: shatter the superpage and fall through. */
             pl2e = alloc_xen_pagetable();
             if ( !pl2e )
-                return -ENOMEM;
+                goto out;
+
             for ( i = 0; i < L2_PAGETABLE_ENTRIES; i++ )
                 l2e_write(pl2e + i,
                           l2e_from_pfn(l3e_get_pfn(*pl3e) +
@@ -5654,7 +5820,8 @@ int modify_xen_mappings(unsigned long s, unsigned long e, unsigned int nf)
                 /* PSE: shatter the superpage and try again. */
                 pl1e = alloc_xen_pagetable();
                 if ( !pl1e )
-                    return -ENOMEM;
+                    goto out;
+
                 for ( i = 0; i < L1_PAGETABLE_ENTRIES; i++ )
                     l1e_write(&pl1e[i],
                               l1e_from_pfn(l2e_get_pfn(*pl2e) + i,
@@ -5783,8 +5950,15 @@ int modify_xen_mappings(unsigned long s, unsigned long e, unsigned int nf)
     flush_area(NULL, FLUSH_TLB_GLOBAL);
 
 #undef FLAGS_MASK
-    return 0;
+    rc = 0;
+
+ out:
+    L3T_UNLOCK(current_l3page);
+    return rc;
 }
+
+#undef L3T_LOCK
+#undef L3T_UNLOCK
 
 #undef flush_area
 

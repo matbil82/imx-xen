@@ -13,8 +13,8 @@
 #define cpu_has_el2_64    (boot_cpu_feature64(el2) >= 1)
 #define cpu_has_el3_32    (boot_cpu_feature64(el3) == 2)
 #define cpu_has_el3_64    (boot_cpu_feature64(el3) >= 1)
-#define cpu_has_fp        (boot_cpu_feature64(fp) == 0)
-#define cpu_has_simd      (boot_cpu_feature64(simd) == 0)
+#define cpu_has_fp        (boot_cpu_feature64(fp) < 8)
+#define cpu_has_simd      (boot_cpu_feature64(simd) < 8)
 #define cpu_has_gicv3     (boot_cpu_feature64(gic) == 1)
 #endif
 
@@ -45,8 +45,13 @@
 #define ARM_SSBD 7
 #define ARM_SMCCC_1_1 8
 #define ARM64_WORKAROUND_AT_SPECULATE 9
+#define ARM_WORKAROUND_858921 10
+#define ARM_WORKAROUND_BHB_LOOP_8 11
+#define ARM_WORKAROUND_BHB_LOOP_24 12
+#define ARM_WORKAROUND_BHB_LOOP_32 13
+#define ARM_WORKAROUND_BHB_SMCC_3 14
 
-#define ARM_NCAPS           10
+#define ARM_NCAPS           15
 
 #ifndef __ASSEMBLY__
 
@@ -182,12 +187,26 @@ struct cpuinfo_arm {
             unsigned long lo:4;
             unsigned long pan:4;
             unsigned long __res1:8;
-            unsigned long __res2:32;
+            unsigned long __res2:28;
+            unsigned long ecbhb:4;
         };
     } mm64;
 
-    struct {
-        uint64_t bits[2];
+    union {
+        uint64_t bits[3];
+        struct {
+            /* ISAR0 */
+            unsigned long __res0:64;
+
+            /* ISAR1 */
+            unsigned long __res1:64;
+
+            /* ISAR2 */
+            unsigned long __res3:28;
+            unsigned long clearbhb:4;
+
+            unsigned long __res4:32;
+        };
     } isa64;
 
 #endif

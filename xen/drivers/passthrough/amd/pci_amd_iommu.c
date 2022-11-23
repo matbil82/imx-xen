@@ -120,7 +120,10 @@ static void amd_iommu_setup_domain_device(
         /* Undo what amd_iommu_disable_domain_device() may have done. */
         ivrs_dev = &get_ivrs_mappings(iommu->seg)[req_id];
         if ( dte->it_root )
+        {
             dte->int_ctl = IOMMU_DEV_TABLE_INT_CONTROL_TRANSLATED;
+            smp_wmb();
+        }
         dte->iv = iommu_intremap;
         dte->ex = ivrs_dev->dte_allow_exclusion;
         dte->sys_mgt = MASK_EXTR(ivrs_dev->device_flags, ACPI_IVHD_SYSTEM_MGMT);
@@ -231,6 +234,8 @@ static int __must_check allocate_domain_resources(struct domain_iommu *hd)
     return rc;
 }
 
+int __read_mostly amd_iommu_min_paging_mode = 1;
+
 static int amd_iommu_domain_init(struct domain *d)
 {
     struct domain_iommu *hd = dom_iommu(d);
@@ -242,11 +247,13 @@ static int amd_iommu_domain_init(struct domain *d)
      * - HVM could in principle use 3 or 4 depending on how much guest
      *   physical address space we give it, but this isn't known yet so use 4
      *   unilaterally.
+     * - Unity maps may require an even higher number.
      */
-    hd->arch.paging_mode = amd_iommu_get_paging_mode(
-        is_hvm_domain(d)
-        ? 1ul << (DEFAULT_DOMAIN_ADDRESS_WIDTH - PAGE_SHIFT)
-        : get_upper_mfn_bound() + 1);
+    hd->arch.paging_mode = max(amd_iommu_get_paging_mode(
+            is_hvm_domain(d)
+            ? 1ul << (DEFAULT_DOMAIN_ADDRESS_WIDTH - PAGE_SHIFT)
+            : get_upper_mfn_bound() + 1),
+        amd_iommu_min_paging_mode);
 
     return 0;
 }
@@ -327,6 +334,7 @@ static int reassign_device(struct domain *source, struct domain *target,
     struct amd_iommu *iommu;
     int bdf, rc;
     struct domain_iommu *t = dom_iommu(target);
+    const struct ivrs_mappings *ivrs_mappings = get_ivrs_mappings(pdev->seg);
 
     bdf = PCI_BDF2(pdev->bus, pdev->devfn);
     iommu = find_iommu_for_device(pdev->seg, bdf);
@@ -341,10 +349,24 @@ static int reassign_device(struct domain *source, struct domain *target,
 
     amd_iommu_disable_domain_device(source, iommu, devfn, pdev);
 
-    if ( devfn == pdev->devfn )
+    /*
+     * If the device belongs to the hardware domain, and it has a unity mapping,
+     * don't remove it from the hardware domain, because BIOS may reference that
+     * mapping.
+     */
+    if ( !is_hardware_domain(source) )
     {
-        list_move(&pdev->domain_list, &target->pdev_list);
-        pdev->domain = target;
+        rc = amd_iommu_reserve_domain_unity_unmap(
+                 source,
+                 ivrs_mappings[get_dma_requestor_id(pdev->seg, bdf)].unity_map);
+        if ( rc )
+            return rc;
+    }
+
+    if ( devfn == pdev->devfn && pdev->domain != dom_io )
+    {
+        list_move(&pdev->domain_list, &dom_io->pdev_list);
+        pdev->domain = dom_io;
     }
 
     rc = allocate_domain_resources(t);
@@ -356,6 +378,12 @@ static int reassign_device(struct domain *source, struct domain *target,
                     pdev->seg, pdev->bus, PCI_SLOT(devfn), PCI_FUNC(devfn),
                     source->domain_id, target->domain_id);
 
+    if ( devfn == pdev->devfn && pdev->domain != target )
+    {
+        list_move(&pdev->domain_list, &target->pdev_list);
+        pdev->domain = target;
+    }
+
     return 0;
 }
 
@@ -366,18 +394,28 @@ static int amd_iommu_assign_device(struct domain *d, u8 devfn,
     struct ivrs_mappings *ivrs_mappings = get_ivrs_mappings(pdev->seg);
     int bdf = PCI_BDF2(pdev->bus, devfn);
     int req_id = get_dma_requestor_id(pdev->seg, bdf);
+    int rc = amd_iommu_reserve_domain_unity_map(
+                 d, ivrs_mappings[req_id].unity_map, flag);
 
-    if ( ivrs_mappings[req_id].unity_map_enable )
+    if ( !rc )
+        rc = reassign_device(pdev->domain, d, devfn, pdev);
+
+    if ( rc && !is_hardware_domain(d) )
     {
-        amd_iommu_reserve_domain_unity_map(
-            d,
-            ivrs_mappings[req_id].addr_range_start,
-            ivrs_mappings[req_id].addr_range_length,
-            ivrs_mappings[req_id].write_permission,
-            ivrs_mappings[req_id].read_permission);
+        int ret = amd_iommu_reserve_domain_unity_unmap(
+                      d, ivrs_mappings[req_id].unity_map);
+
+        if ( ret )
+        {
+            printk(XENLOG_ERR "AMD-Vi: "
+                   "unity-unmap for %pd/%04x:%02x:%02x.%u failed (%d)\n",
+                   d, pdev->seg, pdev->bus,
+                   PCI_SLOT(devfn), PCI_FUNC(devfn), ret);
+            domain_crash(d);
+        }
     }
 
-    return reassign_device(pdev->domain, d, devfn, pdev);
+    return rc;
 }
 
 static void deallocate_next_page_table(struct page_info *pg, int level)
@@ -390,7 +428,7 @@ static void deallocate_next_page_table(struct page_info *pg, int level)
 
 static void deallocate_page_table(struct page_info *pg)
 {
-    struct amd_iommu_pte *table_vaddr;
+    union amd_iommu_pte *table_vaddr;
     unsigned int index, level = PFN_ORDER(pg);
 
     PFN_ORDER(pg) = 0;
@@ -405,7 +443,7 @@ static void deallocate_page_table(struct page_info *pg)
 
     for ( index = 0; index < PTE_PER_TABLE_SIZE; index++ )
     {
-        struct amd_iommu_pte *pde = &table_vaddr[index];
+        union amd_iommu_pte *pde = &table_vaddr[index];
 
         if ( pde->mfn && pde->next_level && pde->pr )
         {
@@ -436,6 +474,7 @@ static void deallocate_iommu_page_tables(struct domain *d)
 
 static void amd_iommu_domain_destroy(struct domain *d)
 {
+    iommu_identity_map_teardown(d);
     deallocate_iommu_page_tables(d);
     amd_iommu_flush_all_pages(d);
 }
@@ -557,7 +596,7 @@ static void amd_dump_p2m_table_level(struct page_info* pg, int level,
                                      paddr_t gpa, int indent)
 {
     paddr_t address;
-    struct amd_iommu_pte *table_vaddr;
+    const union amd_iommu_pte *table_vaddr;
     int index;
 
     if ( level < 1 )
@@ -573,7 +612,7 @@ static void amd_dump_p2m_table_level(struct page_info* pg, int level,
 
     for ( index = 0; index < PTE_PER_TABLE_SIZE; index++ )
     {
-        struct amd_iommu_pte *pde = &table_vaddr[index];
+        const union amd_iommu_pte *pde = &table_vaddr[index];
 
         if ( !(index % 2) )
             process_pending_softirqs();

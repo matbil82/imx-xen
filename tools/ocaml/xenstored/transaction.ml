@@ -82,6 +82,7 @@ type t = {
 	start_count: int64;
 	store: Store.t; (* This is the store that we change in write operations. *)
 	quota: Quota.t;
+	oldroot: Store.Node.t;
 	mutable paths: (Xenbus.Xb.Op.operation * Store.Path.t) list;
 	mutable operations: (Packet.request * Packet.response) list;
 	mutable read_lowpath: Store.Path.t option;
@@ -123,6 +124,7 @@ let make ?(internal=false) id store =
 		start_count = !counter;
 		store = if id = none then store else Store.copy store;
 		quota = Quota.copy store.Store.quota;
+		oldroot = Store.get_root store;
 		paths = [];
 		operations = [];
 		read_lowpath = None;
@@ -136,6 +138,8 @@ let make ?(internal=false) id store =
 
 let get_store t = t.store
 let get_paths t = t.paths
+
+let get_root t = Store.get_root t.store
 
 let is_read_only t = t.paths = []
 let add_wop t ty path = t.paths <- (ty, path) :: t.paths
@@ -161,7 +165,7 @@ let write t perm path value =
 
 let mkdir ?(with_watch=true) t perm path =
 	Store.mkdir t.store perm path;
-	set_write_lowpath t path;
+	set_write_lowpath t (Store.Path.get_parent path);
 	if with_watch then
 		add_wop t Xenbus.Xb.Op.Mkdir path
 

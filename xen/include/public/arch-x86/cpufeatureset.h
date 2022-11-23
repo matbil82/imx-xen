@@ -195,14 +195,14 @@ XEN_CPUFEATURE(FSGSBASE,      5*32+ 0) /*A  {RD,WR}{FS,GS}BASE instructions */
 XEN_CPUFEATURE(TSC_ADJUST,    5*32+ 1) /*S  TSC_ADJUST MSR available */
 XEN_CPUFEATURE(SGX,           5*32+ 2) /*   Software Guard extensions */
 XEN_CPUFEATURE(BMI1,          5*32+ 3) /*A  1st bit manipulation extensions */
-XEN_CPUFEATURE(HLE,           5*32+ 4) /*A  Hardware Lock Elision */
+XEN_CPUFEATURE(HLE,           5*32+ 4) /*!A Hardware Lock Elision */
 XEN_CPUFEATURE(AVX2,          5*32+ 5) /*A  AVX2 instructions */
 XEN_CPUFEATURE(FDP_EXCP_ONLY, 5*32+ 6) /*!  x87 FDP only updated on exception. */
 XEN_CPUFEATURE(SMEP,          5*32+ 7) /*S  Supervisor Mode Execution Protection */
 XEN_CPUFEATURE(BMI2,          5*32+ 8) /*A  2nd bit manipulation extensions */
 XEN_CPUFEATURE(ERMS,          5*32+ 9) /*A  Enhanced REP MOVSB/STOSB */
 XEN_CPUFEATURE(INVPCID,       5*32+10) /*H  Invalidate Process Context ID */
-XEN_CPUFEATURE(RTM,           5*32+11) /*A  Restricted Transactional Memory */
+XEN_CPUFEATURE(RTM,           5*32+11) /*!A Restricted Transactional Memory */
 XEN_CPUFEATURE(PQM,           5*32+12) /*   Platform QoS Monitoring */
 XEN_CPUFEATURE(NO_FPU_SEL,    5*32+13) /*!  FPU CS/DS stored as zero */
 XEN_CPUFEATURE(MPX,           5*32+14) /*S  Memory Protection Extensions */
@@ -259,7 +259,7 @@ XEN_CPUFEATURE(CET_IBT,       9*32+20) /*   CET - Indirect Branch Tracking */
 XEN_CPUFEATURE(IBRSB,         9*32+26) /*A  IBRS and IBPB support (used by Intel) */
 XEN_CPUFEATURE(STIBP,         9*32+27) /*A  STIBP */
 XEN_CPUFEATURE(L1D_FLUSH,     9*32+28) /*S  MSR_FLUSH_CMD and L1D flush. */
-XEN_CPUFEATURE(ARCH_CAPS,     9*32+29) /*   IA32_ARCH_CAPABILITIES MSR */
+XEN_CPUFEATURE(ARCH_CAPS,     9*32+29) /*!  IA32_ARCH_CAPABILITIES MSR */
 XEN_CPUFEATURE(SSBD,          9*32+31) /*A  MSR_SPEC_CTRL.SSBD available */
 
 /* Intel-defined CPU features, CPUID level 0x00000007:1.eax, word 10 */
